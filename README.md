@@ -34,8 +34,12 @@ pub trait Upstream: Send + Sync {
 | `/v1/*`、`/health` | 默认上游（`--upstream`，默认 `codebuddy`） |
 | `/codebuddy/v1/*`、`/workbuddy/v1/*` | CodeBuddy / WorkBuddy（**同一上游的两个别名**） |
 | `/trae/v1/*`、`/trae/health` | 强制 Trae |
+| `/nvidia/v1/*`、`/nvidia/health` | OpenCode `auth.json` 里的 NVIDIA 服务商 |
+| `/modelscope/v1/*`、`/modelscope/health` | OpenCode `auth.json` 里的 ModelScope 服务商 |
 
 > **关于 `codebuddy` 与 `workbuddy`**：二者是同一个上游。WorkBuddy 与 CodeBuddy 共用同一套登录态文件（`CodeBuddyExtension/.../auth/*.info`，优先读 `workbuddy-desktop.info`）和同一个后端 `copilot.tencent.com`。两个前缀都可用，指向同一实例。
+
+> **关于 `nvidia` / `modelscope`**：这两个上游读取本机 **OpenCode** 的 `auth.json`（`~/.local/share/opencode/auth.json`），把其中标准 OpenAI 兼容的服务商 key 暴露出来。每个 provider 以自身名字注册为一个独立上游，走后端各自的 OpenAI 兼容端点。
 
 未配置的上游前缀返回 404 并列出可用上游，互不影响。
 
@@ -43,6 +47,7 @@ pub trait Upstream: Send + Sync {
 
 - **CodeBuddy**：读本机 auth `.info` 凭据 → 直连 `copilot.tencent.com/v2/chat/completions`（该后端本身就是标准 OpenAI 协议，含原生 tools / SSE）。token 过期自动刷新并原子回写，支持 WorkBuddy 5.6.0+ `$wbEncrypted` 加密信封（issue #23）。
 - **Trae**：解密 `storage.json` 里 AES-128-CBC 加密的登录态 blob 取 JWT → 调 `trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`（**字节私有协议，非 OpenAI 兼容**）→ 把私有 SSE 事件实时转成 OpenAI chunk。请求体需包装成 `{messages, function, config_name, model, ...}` 且 content 必须是数组。
+- **OpenCode（nvidia / modelscope）**：读本机 OpenCode 的 `auth.json`，取其中的 API key → 直连各服务商的 **标准 OpenAI 兼容**端点（NVIDIA `integrate.api.nvidia.com/v1`、ModelScope `api-inference.modelscope.cn/v1`）→ 注入 `Authorization: Bearer <key>` 后恒等转发。模型列表直接向上游 `/v1/models` 拉取。
 
 ## 接口
 
@@ -59,10 +64,118 @@ pub trait Upstream: Send + Sync {
 
 ## 构建
 
+### 环境要求
+
+- **Rust 1.75+**（本项目使用 2021 edition；在 1.99 上验证通过）
+- Windows 需要 MSVC 工具链（`stable-x86_64-pc-windows-msvc`）
+- 无需额外系统依赖（HTTP/TLS 由 rustls 提供，不依赖 OpenSSL）
+
+安装/更新工具链：
+
 ```bash
-cargo build --release
-# 产物: target/release/codebuddy2api.exe
+rustup update stable
 ```
+
+### 标准构建
+
+```bash
+git clone <本仓库>
+cd agents2api
+
+# 开发构建（快，未优化，产物大）
+cargo build
+# → target/debug/codebuddy2api(.exe)
+
+# 发布构建（推荐，opt-level=2 + strip）
+cargo build --release
+# → target/release/codebuddy2api(.exe)  约 7.3 MB
+```
+
+产物是**单文件静态二进制**，无需运行时依赖，直接拷走即可运行：
+
+```bash
+# Windows
+target\release\codebuddy2api.exe --help
+
+# Linux / macOS
+./target/release/codebuddy2api --help
+```
+
+### 运行测试
+
+```bash
+cargo test                       # 全部 89 个用例
+cargo test trae                  # 只跑 Trae 相关
+cargo test -- --nocapture        # 显示输出
+```
+
+### 检查与格式化
+
+```bash
+cargo check                      # 只做类型检查，比 build 快
+cargo clippy --all-targets       # 静态检查（当前零警告）
+cargo fmt                        # 格式化
+```
+
+提交前建议依次跑：`cargo fmt` → `cargo clippy --all-targets` → `cargo test`。
+
+### 打包分发
+
+构建后把二进制与文档一起复制到 `dist/`：
+
+```bash
+# Linux / macOS
+mkdir -p dist
+cp target/release/codebuddy2api dist/
+cp README.md dist/
+
+# Windows (Git Bash)
+mkdir -p dist
+cp target/release/codebuddy2api.exe dist/
+cp README.md dist/
+```
+
+`dist/` 已在 `.gitignore` 中，不会误提交。
+
+### 跨平台编译
+
+```bash
+# 先添加目标平台
+rustup target add x86_64-unknown-linux-gnu
+rustup target add aarch64-apple-darwin
+
+# 编译到指定目标
+cargo build --release --target x86_64-unknown-linux-gnu
+```
+
+> 跨平台交叉编译到 Linux/macOS 需要对应的链接器（如 `cross` 或 `cargo-zigbuild`）。
+> Windows 上编译 Windows 版无需任何额外配置。
+
+### 构建产物说明
+
+| 路径 | 说明 |
+|------|------|
+| `target/debug/codebuddy2api` | 开发构建，含调试符号，编译快 |
+| `target/release/codebuddy2api` | 发布构建，已 strip，体积小、运行快 |
+| `target/release/build/` | 构建脚本产物（winresource 写入的版本信息资源） |
+
+### 常见问题
+
+**杀毒软件报毒**：构建出的 exe 可能被杀软启发式误报（如火绒报 `Trojan/Intercept.a`）。
+构建后若 exe 立即消失，请把项目目录加入杀软信任区（详见文末「杀毒软件误报」）。
+
+**`拒绝访问 (os error 5)`**：目标 exe 正在运行，占用了文件。先终止进程再重新构建：
+
+```bash
+# Windows
+taskkill /F /IM codebuddy2api.exe
+
+# Linux / macOS
+pkill -f codebuddy2api
+```
+
+**构建很慢**：首次构建需编译全部依赖（约 1–2 分钟），后续增量构建只需几秒。
+可用 `cargo build --release -j 8` 指定并行度。
 
 ## 运行
 
@@ -91,6 +204,7 @@ codebuddy2api.exe --disable-upstream codebuddy
 | `--codebuddy-backend URL` | 覆盖 CodeBuddy 后端地址 |
 | `--trae-chat-host URL` | 覆盖 Trae chat host |
 | `--trae-storage-json PATH` | 显式指定 Trae storage.json |
+| `--opencode-auth-json PATH` | 显式指定 OpenCode auth.json |
 
 ### 环境变量
 
@@ -103,6 +217,7 @@ codebuddy2api.exe --disable-upstream codebuddy
 | `TRAE_CHAT_HOST` | Trae 上游 host |
 | `TRAE_APP_VERSION_CODE` / `TRAE_IDE_VERSION` | Trae 版本号（见下方说明） |
 | `TRAE_SALT_A..D` | 覆盖 Trae 解密 salt（逗号分隔十进制字节） |
+| `OPENCODE_AUTH_JSON` | OpenCode auth.json 路径（不设则自动探测） |
 | `CODEBUDDY_LOSSY_PROJECTION` | `1` = 启用 /v1/responses 有损投影 |
 | `CODEBUDDY_RESPONSES_DESENSITIZE` | `1` = /v1/responses 也脱敏 |
 
@@ -120,6 +235,10 @@ codebuddy2api.exe --disable-upstream codebuddy
 - `%APPDATA%\TRAE SOLO\User\globalStorage\storage.json`
 
 登录态是 `iCubeAuthInfo://icube.cloudide` 键下的加密 blob（`[6B header][32B random][AES-128-CBC]`），密钥由 `SHA512(SHA512(random) ‖ salt)` 派生。
+
+**OpenCode**（`auth.json`，取其中的 `nvidia` / `modelscope` 项）：
+- Windows `%APPDATA%\opencode\auth.json`（也探测 `%USERPROFILE%\.local\share\opencode\`）
+- macOS / Linux `~/.local/share/opencode/auth.json`（也探测 `~/.config/opencode/`）
 
 ## Trae 支持的现状
 
@@ -162,10 +281,20 @@ Trae 上游是**逆向实现的私有协议**（参考 [smart-open/TraeWorkAssis
 ## 测试
 
 ```bash
-cargo test   # 75 个用例
+cargo test            # 全部 89 个用例
+cargo test trae       # 只跑 Trae 相关
 ```
 
-覆盖：三个协议适配器（请求转换 + 流式事件转换 + 回归用例）、Trae 解密往返与篡改检测、Trae 私有事件映射（含实测 `event:` 行格式）、错误码映射、多上游路由分发、身份过滤、零宽脱敏、投影压缩。
+覆盖范围：
+
+- **协议适配器**：Anthropic / Responses 的请求转换与流式事件转换（tool_calls 分片合并、
+  usage 合并、cached_tokens 兜底链、sequence_number 连续性、上游错误不能变空成功、
+  incomplete 输出）
+- **Trae 上游**：storage.json 解密往返与篡改检测、私有事件映射（含实测 `event:` 行格式、
+  拆分式 tool_calls 全链路聚合回归）、请求头与必填字段、模型映射与 function 视图选择、
+  错误码映射
+- **多上游**：路径前缀路由分发、按上游隔离的模型列表、未知上游 404
+- **其余**：身份声明过滤、零宽脱敏、Responses 投影压缩、CodeBuddy 加解密往返
 
 ## ⚠️ 杀毒软件误报
 

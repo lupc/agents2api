@@ -698,16 +698,15 @@ fn choose_tail_start(messages: &[Value]) -> usize {
     }
     let mut start = messages.len() - 1;
     let mut total_chars = 0usize;
-    let mut kept = 0usize;
 
-    for idx in (0..messages.len()).rev() {
+    // 从末尾往前收，直到达到消息数或字符数上限（至少保留一条）
+    for (kept, idx) in (0..messages.len()).rev().enumerate() {
         let cost = message_cost(&messages[idx]);
         if kept > 0 && (kept >= MAX_TAIL_MESSAGES || total_chars + cost > MAX_TAIL_CHARS) {
             break;
         }
         start = idx;
         total_chars += cost;
-        kept += 1;
     }
     start
 }
@@ -761,12 +760,7 @@ fn expand_tail_for_tool_context(messages: &[Value], start: usize) -> usize {
 }
 
 fn latest_user_index(messages: &[Value]) -> Option<usize> {
-    for idx in (0..messages.len()).rev() {
-        if messages[idx].get("role").and_then(|r| r.as_str()) == Some("user") {
-            return Some(idx);
-        }
-    }
-    None
+    (0..messages.len()).rev().find(|&idx| messages[idx].get("role").and_then(|r| r.as_str()) == Some("user"))
 }
 
 // ---------------------------------------------------------------------------

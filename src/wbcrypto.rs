@@ -108,16 +108,14 @@ static KEY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// 返回 (protector_key 32B, keyId 16hex)。结果缓存；失败时按 env 兜底。
 async fn protector_key() -> Result<(Vec<u8>, String), String> {
-    if let Some(cache) = KEY_CACHE.get() {
-        if let Some(kv) = cache {
-            return Ok(kv.clone());
-        }
+    // 快路径：已在缓存中
+    if let Some(Some(kv)) = KEY_CACHE.get() {
+        return Ok(kv.clone());
     }
     let _guard = KEY_LOCK.lock().await;
-    if let Some(cache) = KEY_CACHE.get() {
-        if let Some(kv) = cache {
-            return Ok(kv.clone());
-        }
+    // 双检：等锁期间可能已被其它任务写入
+    if let Some(Some(kv)) = KEY_CACHE.get() {
+        return Ok(kv.clone());
     }
     let secret_b64 = match std::env::var("WORKBUDDY_AT_REST_SECRET") {
         Ok(s) if !s.is_empty() => s,

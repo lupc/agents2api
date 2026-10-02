@@ -7,6 +7,11 @@
 //! 四个端点的共同流程（准备请求 → 发起 → 流式转发 / 非流式聚合）下沉到
 //! [`execute_upstream`]，各协议适配器只负责「转换请求体」和「转换响应流」。
 
+// 本模块大量使用 `Result<_, Response>` 作为错误类型，这是 axum handler 的惯例
+// （Handler 必须直接返回 Response）。`Response` 本身较大，但只出现在错误路径上，
+// 装箱反而增加分配与复杂度。
+#![allow(clippy::result_large_err)]
+
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
