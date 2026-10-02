@@ -39,6 +39,7 @@ pub fn rand_hex(n: usize) -> String {
 #[derive(Parser, Debug)]
 #[command(
     name = "codebuddy2api",
+    version,
     about = "CodeBuddy / Trae -> OpenAI 兼容转换器（直连后端）"
 )]
 struct Cli {
