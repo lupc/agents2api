@@ -1,39 +1,7 @@
-//! 上游 SSE 处理：行流拆分、非流式聚合、错误事件构造。
+//! 上游 SSE 处理：非流式聚合、错误事件构造。
 
-use bytes::Bytes;
-use futures::Stream;
-use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-
-/// 把字节流拆成行（等价于 Python httpx 的 `aiter_lines`，去掉行尾 \r\n）。
-pub fn line_stream<S>(mut stream: S) -> impl Stream<Item = String>
-where
-    S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
-{
-    async_stream::stream! {
-        let mut buf: Vec<u8> = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(b) => {
-                    buf.extend_from_slice(&b);
-                    while let Some(pos) = buf.iter().position(|&c| c == b'\n') {
-                        let line: Vec<u8> = buf.drain(..=pos).collect();
-                        let mut s = String::from_utf8_lossy(&line[..line.len() - 1]).to_string();
-                        if s.ends_with('\r') {
-                            s.pop();
-                        }
-                        yield s;
-                    }
-                }
-                Err(_) => { break; }
-            }
-        }
-        if !buf.is_empty() {
-            yield String::from_utf8_lossy(&buf).to_string();
-        }
-    }
-}
 
 /// 解析一行 SSE 的 data 载荷；非 data 行 / [DONE] / 非法 JSON 返回 None。
 pub fn parse_data_line(line: &str) -> Option<Value> {

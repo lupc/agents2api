@@ -13,8 +13,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 futures = "0.3"
 async-stream = "0.3"
+async-trait = "0.1"
 regex = "1"
 aes-gcm = "0.10"
+aes = "0.8"
+cbc = "0.1"
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"

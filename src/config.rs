@@ -1,11 +1,11 @@
 //! 应用配置、共享状态与文件日志。
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::auth::CredentialManager;
+use crate::upstream::Upstream;
 
 #[derive(Clone)]
 pub struct AppConfig {
@@ -62,8 +62,22 @@ impl Logger {
 /// 共享应用状态。
 pub struct AppState {
     pub config: AppConfig,
-    pub cred: Option<CredentialManager>,
+    /// 已配置的上游（key = 上游名，如 `codebuddy` / `trae`）。
+    pub upstreams: HashMap<String, Arc<dyn Upstream>>,
+    /// 无路径前缀时使用的默认上游名。
+    pub default_upstream: String,
     pub http: reqwest::Client,
+}
+
+impl AppState {
+    /// 按名字取上游；名字为 `None` 或空串时取默认上游。
+    pub fn upstream(&self, name: Option<&str>) -> Option<Arc<dyn Upstream>> {
+        let key = match name {
+            Some(n) if !n.is_empty() => n,
+            _ => self.default_upstream.as_str(),
+        };
+        self.upstreams.get(key).cloned()
+    }
 }
 
 pub type SharedState = std::sync::Arc<AppState>;
