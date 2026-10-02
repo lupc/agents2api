@@ -84,17 +84,18 @@ fn build_upstreams(cli: &Cli) -> HashMap<String, Arc<dyn Upstream>> {
     let mut map: HashMap<String, Arc<dyn Upstream>> = HashMap::new();
     let disabled = |name: &str| cli.disable_upstream.iter().any(|d| d == name);
 
-    // CodeBuddy（凭据缺失时也注册，运行时报明确错误）
-    if !disabled("codebuddy") {
+    // CodeBuddy / WorkBuddy 是同一个上游：二者共用登录态文件与后端
+    // （auth 目录为 CodeBuddyExtension，优先读 workbuddy-desktop.info）。
+    // 两个名字都注册，避免用户按自己安装的客户端名调用时 404。
+    if !disabled("codebuddy") && !disabled("workbuddy") {
         if let Some(path) = auth::find_auth_file() {
             let cred = auth::CredentialManager::new(path);
-            map.insert(
-                "codebuddy".to_string(),
-                Arc::new(CodeBuddyUpstream::new(
-                    cred,
-                    cli.codebuddy_backend.clone(),
-                )),
-            );
+            let inst: Arc<dyn Upstream> = Arc::new(CodeBuddyUpstream::new(
+                cred,
+                cli.codebuddy_backend.clone(),
+            ));
+            map.insert("codebuddy".to_string(), inst.clone());
+            map.insert("workbuddy".to_string(), inst);
         }
     }
 

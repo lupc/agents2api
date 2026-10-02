@@ -32,8 +32,10 @@ pub trait Upstream: Send + Sync {
 | 路径 | 上游 |
 |------|------|
 | `/v1/*`、`/health` | 默认上游（`--upstream`，默认 `codebuddy`） |
-| `/codebuddy/v1/*`、`/codebuddy/health` | 强制 CodeBuddy |
+| `/codebuddy/v1/*`、`/workbuddy/v1/*` | CodeBuddy / WorkBuddy（**同一上游的两个别名**） |
 | `/trae/v1/*`、`/trae/health` | 强制 Trae |
+
+> **关于 `codebuddy` 与 `workbuddy`**：二者是同一个上游。WorkBuddy 与 CodeBuddy 共用同一套登录态文件（`CodeBuddyExtension/.../auth/*.info`，优先读 `workbuddy-desktop.info`）和同一个后端 `copilot.tencent.com`。两个前缀都可用，指向同一实例。
 
 未配置的上游前缀返回 404 并列出可用上游，互不影响。
 
