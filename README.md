@@ -88,7 +88,6 @@ codebuddy2api.exe --disable-upstream codebuddy
 | `--skip-check` | 跳过启动预检 |
 | `--codebuddy-backend URL` | 覆盖 CodeBuddy 后端地址 |
 | `--trae-chat-host URL` | 覆盖 Trae chat host |
-| `--trae-function NAME` | 覆盖 Trae `function` 字段（默认 `solo_work_lite`） |
 | `--trae-storage-json PATH` | 显式指定 Trae storage.json |
 
 ### 环境变量
@@ -99,7 +98,7 @@ codebuddy2api.exe --disable-upstream codebuddy
 | `CODEBUDDY2OPENAI_KEY` / `CODEBUDDY2OPENAI_LOG` | 等价 `--api-key` / `--log` |
 | `WORKBUDDY_AT_REST_SECRET` / `WORKBUDDY_ELECTRON_PATH` | WorkBuddy at-rest 密钥 |
 | `TRAE_STORAGE_JSON` | Trae storage.json 路径 |
-| `TRAE_CHAT_HOST` / `TRAE_FUNCTION` | Trae 端点与 function |
+| `TRAE_CHAT_HOST` | Trae 上游 host |
 | `TRAE_APP_VERSION_CODE` / `TRAE_IDE_VERSION` | Trae 版本号（见下方说明） |
 | `TRAE_SALT_A..D` | 覆盖 Trae 解密 salt（逗号分隔十进制字节） |
 | `CODEBUDDY_LOSSY_PROJECTION` | `1` = 启用 /v1/responses 有损投影 |
@@ -120,18 +119,43 @@ codebuddy2api.exe --disable-upstream codebuddy
 
 登录态是 `iCubeAuthInfo://icube.cloudide` 键下的加密 blob（`[6B header][32B random][AES-128-CBC]`），密钥由 `SHA512(SHA512(random) ‖ salt)` 派生。
 
-## Trae 支持的现状与已知限制
+## Trae 支持的现状
 
-Trae 上游是**逆向实现的私有协议**，实测状态如下：
+Trae 上游是**逆向实现的私有协议**（参考 [smart-open/TraeWorkAssistant](https://github.com/smart-open/TraeWorkAssistant) 的真机验证实现），当前状态：
 
-- ✅ 登录态解密、JWT 提取、鉴权头注入、请求体包装、路径路由均正常（已对本机真实 Trae CN 登录态验证，成功通过鉴权）
-- ✅ 私有 SSE → OpenAI chunk 的事件转换（`event:` 行格式、`output`/`done`/`error`/`token_usage` 等）
-- ✅ 错误码映射（`1001`→401、`4008/1005`→402、`4001`→400、`4011`→429）
-- ⚠️ **`app_version_code` 需与客户端版本匹配**：上游对未知值返回 `4001 param is invalid`。默认值未必适用于你的版本，若遇到 4001，请用抓包得到真实值后设 `TRAE_APP_VERSION_CODE=<int64>`。
-- ⚠️ 上游协议无官方文档、可能随客户端更新漂移；`create_agent_task`/Work 通道未实现（当前只做 IDE Agent 单请求端点）。
-- ⚠️ Trae 的 token 刷新与客户端登录可能互斥，故**只读不刷新**；过期时返回明确提示，请重开 Trae 登录。
+- ✅ **端到端可用**：登录态解密、鉴权、对话、流式、工具调用、thinking 全部实测通过
+- ✅ 已实测的模型：`deepseek-v4-flash`、`deepseek-v4-pro`、`glm-5.3`、`glm-5.2`、`kimi-k3` 等
+- ✅ 支持 `reasoning_content`（思维链）、`tool_calls`（含增量分片合并）、usage
 
-遇到 4001 时的排查建议：用 `--log` 启动，日志里会打印「发往上游的 WIRE BODY」与「TRAE RAW SSE」，据此比对真实客户端请求。
+### 协议要点（踩过的坑）
+
+这几处与原项目早期实现不同，都是真机验证后才修对的：
+
+| 项 | 正确做法 |
+|----|---------|
+| 鉴权头 | **`x-ide-token: <裸 JWT>`**，不发 `Authorization`。带 `Cloud-IDE-JWT ` 前缀会被网关在 token 校验前拒绝（401 / code 1001） |
+| 版本号 | 在 **header**（`x-app-version-code` / `x-ide-version-code` = `20260811`），不在 body |
+| 请求体必填 | `prompt_max_tokens: 168000`（缺失或传 1M 都返回 4001）、`model_name`（`<config>__dev`）、`user_id`、`device_id`、`machine_id`、`workspace_id`、`mode: FunctionCall` 等 |
+| 模型映射 | `config_name`（展示名）+ `model_name`（内部名）双字段；如 `deepseek-v4-flash` → `DeepSeek-V4-Flash` / `deepseek_v4_flash__dev` |
+| function 视图 | 多数模型用 `solo_work_lite`；`deepseek-v4.1-flash`、`doubao-seed-code`、`glm-5.3-flash`、`qwen3.8-flash`、`kimi-k2.8-preview` 只在 `solo_agent` 下可用 |
+| SSE 事件名 | **只从 `event:` 行取**，payload 的 `type` 字段不参与判定 |
+| SSE 文本字段 | 取 **`response`**（不是 `content`）；思维链在 `reasoning_content` |
+| 工具调用 | `function_call` 子对象；**一次调用会拆成多个增量块**（首块给 id+name，后续块只给 arguments），需按 index 累积 |
+| 错误码 | `4001`（param invalid / model config mismatch）是**请求级**错误，与账号无关，直接透传 400 |
+
+若上游返回 `4001`，排查顺序：①`prompt_max_tokens` 是否为 168000；②模型名是否拼写正确；③该模型是否需要在 `solo_agent` 视图。
+
+可用 `--log` 启动，日志会打印「发往上游的 WIRE BODY」与「TRAE RAW SSE」便于比对。
+
+### 环境变量
+
+| 变量 | 说明 |
+|------|------|
+| `TRAE_CHAT_HOST` | 上游 host（默认 `https://trae-api-cn.mchost.guru`） |
+| `TRAE_IDE_VERSION` / `TRAE_IDE_VERSION_CODE` | 客户端版本 / 版本代码（默认 `0.1.50` / `20260811`） |
+| `TRAE_APP_ID` | 应用 ID |
+| `TRAE_STORAGE_JSON` | 显式指定 storage.json 路径 |
+| `TRAE_SALT_A..D` | 覆盖解密 salt（逗号分隔十进制字节） |
 
 ## 测试
 

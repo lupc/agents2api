@@ -24,19 +24,14 @@ pub use protocol::{DEFAULT_CHAT_HOST, DEFAULT_MODELS};
 pub struct TraeUpstream {
     cred: TraeCredential,
     chat_host: String,
-    function: String,
 }
 
 impl TraeUpstream {
-    pub fn new(cred: TraeCredential, chat_host: Option<String>, function: Option<String>) -> Self {
+    pub fn new(cred: TraeCredential, chat_host: Option<String>) -> Self {
         Self {
             cred,
             chat_host: chat_host.unwrap_or_else(|| {
                 std::env::var("TRAE_CHAT_HOST").unwrap_or_else(|_| DEFAULT_CHAT_HOST.to_string())
-            }),
-            function: function.unwrap_or_else(|| {
-                std::env::var("TRAE_FUNCTION")
-                    .unwrap_or_else(|_| protocol::DEFAULT_FUNCTION.to_string())
             }),
         }
     }
@@ -60,10 +55,10 @@ impl Upstream for TraeUpstream {
                 info.storage_path.display()
             ));
         }
-        let body = protocol::build_request_body(chat, &self.function);
+        let body = protocol::build_request_body(chat, &info);
         let headers = protocol::build_headers(&info, true);
         Ok(UpstreamRequest {
-            url: format!("{}/api/agent/v3/llm_utils_chat", self.chat_host),
+            url: format!("{}{}", self.chat_host, protocol::AGENT_PATH),
             headers,
             body,
         })
@@ -116,7 +111,7 @@ impl Upstream for TraeUpstream {
         })
     }
 
-    /// Trae 统一走流式，聚合由标准 OpenAI 聚合器完成（转换后已是 OpenAI chunk）。
+    /// 聚合收到的 raw 已由 `translate_stream` 转成标准 OpenAI chunk，直接聚合即可。
     fn aggregate(&self, raw: &[u8]) -> Value {
         super::aggregate_openai_sse(raw)
     }

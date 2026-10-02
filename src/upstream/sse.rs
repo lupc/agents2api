@@ -92,15 +92,21 @@ impl ChatAggregator {
                         .tool_calls
                         .entry(idx)
                         .or_insert_with(|| (None, None, String::new()));
+                    // id / name 只在非空时更新：上游可能把一次 tool_call 拆成多个增量块，
+                    // 后续块带空值，直接覆盖会丢掉首块已建立的 id/name。
                     if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                        slot.0 = Some(id.to_string());
+                        if !id.is_empty() {
+                            slot.0 = Some(id.to_string());
+                        }
                     }
                     if let Some(name) = tc
                         .get("function")
                         .and_then(|f| f.get("name"))
                         .and_then(|n| n.as_str())
                     {
-                        slot.1 = Some(name.to_string());
+                        if !name.is_empty() {
+                            slot.1 = Some(name.to_string());
+                        }
                     }
                     if let Some(args) = tc
                         .get("function")
@@ -127,7 +133,9 @@ impl ChatAggregator {
             }
             tcs = Some(list);
         }
-        let finish_reason = if tcs.is_some() && self.finish_reason.is_none() {
+        // 有 tool_calls 时 finish_reason 必须是 tool_calls：
+        // 部分上游（如 Trae）在有工具调用时仍返回 "stop"，会误导客户端不执行工具。
+        let finish_reason = if tcs.is_some() {
             Some("tool_calls".to_string())
         } else {
             self.finish_reason.clone()

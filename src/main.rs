@@ -74,9 +74,6 @@ struct Cli {
     /// 覆盖 Trae 后端 chat host
     #[arg(long, env = "TRAE_CHAT_HOST")]
     trae_chat_host: Option<String>,
-    /// 覆盖 Trae 的 function 字段（默认 solo_work_lite）
-    #[arg(long, env = "TRAE_FUNCTION")]
-    trae_function: Option<String>,
     /// 显式指定 Trae storage.json 路径
     #[arg(long, env = "TRAE_STORAGE_JSON")]
     trae_storage_json: Option<String>,
@@ -114,7 +111,6 @@ fn build_upstreams(cli: &Cli) -> HashMap<String, Arc<dyn Upstream>> {
                 Arc::new(TraeUpstream::new(
                     TraeCredential::new(path),
                     cli.trae_chat_host.clone(),
-                    cli.trae_function.clone(),
                 )),
             );
         }

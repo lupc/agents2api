@@ -1,72 +1,119 @@
-//! Trae 私有协议：请求体构造与 SSE 事件 → OpenAI chunk 转换。
+//! Trae 私有协议：请求头 / 请求体构造与 SSE 事件 → OpenAI chunk 转换。
 //!
-//! 主通道是 IDE Agent 单请求端点 `POST {chatHost}/api/agent/v3/llm_utils_chat`：
-//! - 请求体形如 `{messages, function, stream, config_name, model, ...}`；
-//! - messages 的 `content` **必须是数组** `[{"type":"text","text":...}]`，传字符串会 400/4001；
-//! - 响应**永远是 SSE**（即使 `stream:false`），且错误可能是 HTTP 200 + 内嵌 error 事件。
+//! 主通道是 IDE Agent 单请求端点 `POST {chatHost}/api/agent/v3/llm_utils_chat`。
 //!
-//! 事件（`chunk.type`）：
-//! - `output` / `text` → 文本增量，取 `content`（新）或 `response`（旧）
-//! - `reasoning` → 思维链增量，取 `reasoning`（新）或 `reasoning_content`（旧）
-//! - `tool_calls` → 工具调用数组，name 取 `name`/`function.name`/`tool_name`，
-//!   args 取 `params`/`arguments`/`input`/`function.arguments`
-//! - `token_usage` → usage（在 `data` 或顶层）
-//! - `done` → 结束，`finish_reason` 默认 `stop`
-//! - `error` → `{code, message}`
+//! 协议细节参考 `smart-open/TraeWorkAssistant`（Rust 实现，已在真机验证）：
+//! - **鉴权头是 `x-ide-token`（裸 JWT）**，不是 `Authorization: Cloud-IDE-JWT`。
+//!   带 `Cloud-IDE-JWT ` 前缀会被网关在 token 校验前直接拒绝（401 / code 1001）。
+//! - 版本号在 **header**（`x-app-version-code` / `x-ide-version-code`），不在 body。
+//! - 请求体有多个必填字段，尤其 `prompt_max_tokens`（固定 168000，
+//!   缺失或传 1M 都会返回 4001）。
+//! - 模型名需映射为 `config_name`（展示名）+ `model_name`（内部名，形如 `xxx__dev`）。
+//! - 响应永远是 SSE；文本增量在 `response` 字段（不是 `content`）；
+//!   事件名只从 `event:` 行取（payload 的 `type` 字段不参与判定）。
 
 use serde_json::{json, Map, Value};
 
 use super::auth::TraeAuthInfo;
 
 pub const DEFAULT_CHAT_HOST: &str = "https://trae-api-cn.mchost.guru";
+pub const AGENT_PATH: &str = "/api/agent/v3/llm_utils_chat";
 pub const DEFAULT_APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
-pub const DEFAULT_IDE_VERSION: &str = "3.3.67";
+/// Trae 客户端版本（`x-ide-version` 与 body 的 `ide_version`）。
+pub const DEFAULT_IDE_VERSION: &str = "0.1.50";
+/// 版本号代码（`x-app-version-code` / `x-ide-version-code` 与 body 的 `ide_version_code`）。
+/// 真机验证值；可用 `TRAE_IDE_VERSION_CODE` 覆盖。
+pub const DEFAULT_IDE_VERSION_CODE: &str = "20260811";
+/// 上游必填的提示词上限。实测：缺失 → 4001；设为 1M → 4001；168000 → 200。
+pub const PROMPT_MAX_TOKENS: i64 = 168_000;
 pub const DEFAULT_FUNCTION: &str = "solo_work_lite";
-
-/// 公开模型名 → Trae 内部名（可扩展；未命中则原样透传）。
-const MODEL_ALIASES: &[(&str, &str)] = &[
-    ("auto", "glm-5.2"),
-    ("gpt-4o", "DeepSeek-V4-Pro"),
-    ("gpt-4o-mini", "DeepSeek-V4-Flash"),
-    ("deepseek-v3", "DeepSeek-V4-Pro"),
-    ("deepseek-chat", "DeepSeek-V4-Pro"),
-    ("claude-3-5-sonnet", "glm-5.2"),
-    ("coding", "glm-5.1"),
+/// 仅在 `solo_agent` 视图下可用的模型。
+const SOLO_AGENT_MODELS: &[&str] = &[
+    "doubao-seed-code",
+    "glm-5.3-flash",
+    "qwen3.8-flash",
+    "deepseek-v4.1-flash",
+    "kimi-k2.8-preview",
 ];
 
 /// 内置模型兜底列表（无法动态拉取时使用）。
 pub const DEFAULT_MODELS: &[&str] = &[
-    "auto",
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "deepseek-v4.1-flash",
     "glm-5.3",
     "glm-5.2",
     "glm-5-turbo",
-    "glm-5",
     "kimi-k3",
     "kimi-k2.7-code",
     "kimi-k2.6",
-    "DeepSeek-V4-Pro",
-    "DeepSeek-V4-Flash",
+    "doubao-seed-code",
     "qwen3.8-max",
     "qwen-3.7-plus",
     "minimax-m3",
-    "doubao-seed-2.1-pro",
 ];
 
-/// 把公开模型名解析成 Trae 内部名。
-pub fn resolve_model_name(model: &str) -> String {
-    let lower = model.to_lowercase();
-    for (public, internal) in MODEL_ALIASES {
-        if lower == *public {
-            return internal.to_string();
+/// 模型显示名 →（canonical `config_name`, 内部 `model_name`）。
+/// 大小写不敏感。未收录返回 `None`，调用方按 `model` + `model__dev` 透传。
+fn model_config(model: &str) -> Option<(&'static str, String)> {
+    let pair: (&'static str, &'static str) = match model.to_lowercase().as_str() {
+        "doubao-seed-evolving" => ("Doubao-Seed-Evolving", "Doubao-Seed-Evolving__dev"),
+        "doubao-seed-2.1-pro" | "seed-code-pro-0430" => {
+            ("Doubao-Seed-2.1-Pro", "Doubao-Seed-2.1-Pro__dev")
         }
+        "doubao-seed-2.1-turbo" => ("Doubao-Seed-2.1-Turbo", "Doubao-Seed-2.1-Turbo__dev"),
+        "doubao-seed-code" => ("Doubao-Seed-Code", "Doubao-Seed-Code__dev"),
+        "glm-5.3-flash" => ("glm-5.3-flash", "glm-5.3-flash__dev"),
+        "qwen3.8-flash" => ("qwen3.8-flash", "qwen3.8-flash__dev"),
+        "glm-5.2" => ("glm-5.2", "glm-5.2__dev"),
+        "glm-5.3" => ("glm-5.3", "glm-5.3__dev"),
+        "glm-5" => ("glm-5", "glm-5__dev"),
+        "glm-5-turbo" => ("glm-5-turbo", "glm-5-turbo__dev"),
+        "deepseek-v4.1-flash" => ("deepseek-v4.1-flash", "deepseek-v4.1-flash__dev"),
+        "deepseek-v4-flash" => ("DeepSeek-V4-Flash", "deepseek_v4_flash__dev"),
+        "deepseek-v4-flash-official" => {
+            ("DeepSeek-V4-Flash-Official", "DeepSeek-V4-Flash-Official__dev")
+        }
+        "deepseek-v4-pro" => ("DeepSeek-V4-Pro", "deepseek_v4_pro__dev"),
+        "deepseek-v4-pro-official" => {
+            ("DeepSeek-V4-Pro-Official", "DeepSeek-V4-Pro-Official__dev")
+        }
+        "kimi-k2.6" => ("kimi-k2.6", "kimi-k2.6__dev"),
+        "kimi-k2.7-code" => ("kimi-k2.7-code", "kimi-k2.7-code__dev"),
+        "kimi-k2.8-preview" => ("kimi-k2.8-preview", "kimi-k2.8-preview__dev"),
+        "kimi-k3" => ("kimi-k3", "kimi-k3__dev"),
+        "minimax-m3" => ("minimax-m3", "minimax-m3__dev"),
+        "qwen3.8-max" => ("qwen3.8-max", "qwen3.8-max__dev"),
+        "qwen-3.7-plus" => ("qwen-3.7-plus", "qwen-3.7-plus__dev"),
+        _ => return None,
+    };
+    Some((pair.0, pair.1.to_string()))
+}
+
+/// 解析模型名 → (`config_name`, `model_name`)。
+pub fn resolve_model(model: &str) -> (String, String) {
+    let model = model.trim();
+    match model_config(model) {
+        Some((c, m)) => (c.to_string(), m),
+        // 未收录模型按实证规律原样透传：model_name = config_name__dev
+        None => (model.to_string(), format!("{model}__dev")),
     }
-    model.to_string()
+}
+
+/// 该模型应该用哪个 `function` 视图。部分模型只在 `solo_agent` 下可用。
+pub fn function_for_model(model: &str) -> &'static str {
+    let lower = model.to_lowercase();
+    if SOLO_AGENT_MODELS.contains(&lower.as_str()) {
+        "solo_agent"
+    } else {
+        DEFAULT_FUNCTION
+    }
 }
 
 /// 把 OpenAI messages 转成 Trae 需要的形式：
 /// - `content` 一律转成 `[{"type":"text","text":...}]`（Trae 硬性要求数组）
 /// - `developer` → `system`
-/// - 图像块转成 Trae 的 `{"type":"image","image_url":...}`（尽力而为，未知类型降级为文本）
+/// - assistant 的 `tool_calls[].function` → `function_call`，无名调用丢弃
 pub fn normalize_messages(messages: &Value) -> Value {
     let Some(arr) = messages.as_array() else {
         return json!([]);
@@ -80,13 +127,40 @@ pub fn normalize_messages(messages: &Value) -> Value {
             "developer" => "system",
             other => other,
         };
-        let content = normalize_content(m.get("content").cloned().unwrap_or(Value::Null));
         let mut msg = Map::new();
         msg.insert("role".to_string(), json!(role));
-        msg.insert("content".to_string(), content);
-        // 保留 tool_calls / tool_call_id（若 Trae 侧支持）
-        if let Some(tcs) = m.get("tool_calls") {
-            msg.insert("tool_calls".to_string(), tcs.clone());
+        msg.insert(
+            "content".to_string(),
+            normalize_content(m.get("content").cloned().unwrap_or(Value::Null)),
+        );
+
+        // assistant 的 tool_calls：function → function_call，去除空名
+        if role == "assistant" {
+            if let Some(tcs) = m.get("tool_calls").and_then(|t| t.as_array()) {
+                let kept: Vec<Value> = tcs
+                    .iter()
+                    .filter_map(|tc| {
+                        let mut tcm = tc.as_object()?.clone();
+                        if let Some(f) = tcm.remove("function") {
+                            tcm.insert("function_call".to_string(), f);
+                        }
+                        let has_name = tcm
+                            .get("function_call")
+                            .and_then(|fc| fc.get("name"))
+                            .and_then(|n| n.as_str())
+                            .map(|s| !s.trim().is_empty())
+                            .unwrap_or(false);
+                        if has_name {
+                            Some(Value::Object(tcm))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !kept.is_empty() {
+                    msg.insert("tool_calls".to_string(), Value::Array(kept));
+                }
+            }
         }
         if let Some(id) = m.get("tool_call_id") {
             msg.insert("tool_call_id".to_string(), id.clone());
@@ -124,7 +198,6 @@ fn normalize_content(content: Value) -> Value {
                             out.push(json!({"type": "image_url", "image_url": {"url": url}}));
                         }
                     }
-                    // tool_result 等：把内容摊平成文本
                     _ => {
                         if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
                             out.push(json!({"type": "text", "text": t}));
@@ -145,112 +218,140 @@ fn normalize_content(content: Value) -> Value {
     }
 }
 
-/// 构造发往 Trae 的请求体（在标准 OpenAI Chat body 基础上包装）。
-pub fn build_request_body(chat: &Value, function: &str) -> Value {
-    let messages = normalize_messages(chat.get("messages").unwrap_or(&json!([])));
-    let raw_model = chat
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("auto");
-    let model = resolve_model_name(raw_model);
+/// 规范化 `tool_choice`；`none` 时移除 tools。
+fn normalize_tool_choice(obj: &mut Map<String, Value>) {
+    let Some(choice) = obj.get("tool_choice").cloned() else {
+        return;
+    };
+    match &choice {
+        Value::String(s) if s == "none" => {
+            obj.remove("tools");
+            obj.insert("tool_choice".to_string(), json!("none"));
+        }
+        Value::String(s) => {
+            obj.insert("tool_choice".to_string(), json!(s));
+        }
+        Value::Object(_) => {
+            let name = choice
+                .pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .or_else(|| choice.get("name").and_then(|n| n.as_str()))
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                obj.insert("tool_choice".to_string(), json!("auto"));
+            } else {
+                obj.insert("tool_choice".to_string(), json!(name));
+            }
+        }
+        _ => {}
+    }
+}
 
-    let mut body = Map::new();
-    body.insert("messages".to_string(), messages);
-    body.insert("function".to_string(), json!(function));
-    body.insert("stream".to_string(), json!(true));
-    body.insert("config_name".to_string(), json!(model));
-    body.insert("model".to_string(), json!(model));
-    body.insert("request_id".to_string(), json!(crate::rand_hex(16)));
-    body.insert("session_id".to_string(), json!(crate::rand_hex(16)));
-    // 部分 Trae 部署要求 body 里带版本号（int64），缺失/类型错会返回 4001
-    body.insert(
-        "app_version_code".to_string(),
-        json!(app_version_code_i64()),
-    );
-    body.insert("ide_version".to_string(), json!(ide_version()));
-
-    // 透传常见生成参数
-    for key in [
-        "max_tokens",
-        "max_completion_tokens",
-        "temperature",
-        "top_p",
-        "presence_penalty",
-        "frequency_penalty",
-        "stop",
-        "seed",
-        "n",
-        "tools",
-        "tool_choice",
-        "parallel_tool_calls",
-    ] {
-        if let Some(v) = chat.get(key) {
-            if !v.is_null() {
-                body.insert(key.to_string(), v.clone());
+/// tool schema 的 `parameters` 必须是 **JSON 字符串**（上游要求）。
+fn normalize_tools(obj: &mut Map<String, Value>) {
+    let Some(tools) = obj.get_mut("tools").and_then(|t| t.as_array_mut()) else {
+        return;
+    };
+    for tool in tools.iter_mut() {
+        let Some(tm) = tool.as_object_mut() else { continue };
+        // 顶层若是 Responses 扁平格式，转成嵌套 function
+        if tm.get("function").is_none() && tm.get("type").and_then(|t| t.as_str()) == Some("function")
+        {
+            let mut f = Map::new();
+            for k in ["name", "description", "parameters", "strict"] {
+                if let Some(v) = tm.get(k) {
+                    f.insert(k.to_string(), v.clone());
+                }
+            }
+            let mut nt = Map::new();
+            nt.insert("type".to_string(), json!("function"));
+            nt.insert("function".to_string(), Value::Object(f));
+            *tm = nt;
+        }
+        if let Some(params) = tm
+            .get_mut("function")
+            .and_then(|f| f.as_object_mut())
+            .and_then(|f| f.get_mut("parameters"))
+        {
+            if params.is_object() {
+                let s = params.to_string();
+                *params = json!(s);
             }
         }
     }
-    Value::Object(body)
 }
 
-/// 构造发往 Trae 的请求头。
-pub fn build_headers(info: &TraeAuthInfo, stream: bool) -> Vec<(String, String)> {
-    let env_or = |key: &str, default: &str| -> String {
-        std::env::var(key).unwrap_or_else(|_| default.to_string())
-    };
-    let app_id = env_or("TRAE_APP_ID", DEFAULT_APP_ID);
-    let ide_version = env_or("TRAE_IDE_VERSION", DEFAULT_IDE_VERSION);
-    let request_id = uuid_like();
-    let trace_id = crate::rand_hex(16);
-    let span_id: String = trace_id.chars().take(16).collect();
+/// 构造发往 Trae 的请求体（在标准 OpenAI Chat body 基础上包装）。
+pub fn build_request_body(chat: &Value, info: &TraeAuthInfo) -> Value {
+    let mut obj: Map<String, Value> = chat.as_object().cloned().unwrap_or_default();
 
-    let mut headers = vec![
-        ("Content-Type".to_string(), "application/json".to_string()),
-        (
-            "Authorization".to_string(),
-            format!("Cloud-IDE-JWT {}", info.token),
-        ),
-        ("X-Cloudide-Token".to_string(), info.token.clone()),
-        ("x-ide-token".to_string(), info.token.clone()),
-        ("x-app-id".to_string(), app_id),
-        ("x-uid".to_string(), info.user_id.clone()),
-        ("x-device-id".to_string(), info.device_id.clone()),
-        ("x-machine-id".to_string(), info.machine_id.clone()),
-        ("x-request-id".to_string(), request_id.clone()),
-        ("X-Request-ID".to_string(), request_id.clone()),
-        ("X-Trae-Request-ID".to_string(), request_id),
-        ("x-custom-trace-id".to_string(), trace_id.clone()),
-        (
-            "x-flow-traceparent".to_string(),
-            format!("04-{trace_id}-{span_id}-01"),
-        ),
-        ("x-app-version".to_string(), "default".to_string()),
-        ("x-app-version-code".to_string(), app_version_code()),
-        ("x-ide-version".to_string(), ide_version),
-        ("x-ide-version-code".to_string(), ide_version_code()),
-        ("x-ide-version-type".to_string(), "stable".to_string()),
-        ("x-device-type".to_string(), device_type().to_string()),
-        ("x-os-version".to_string(), "10.0".to_string()),
-        ("x-device-brand".to_string(), "unknown".to_string()),
-        ("x-device-cpu".to_string(), std::env::consts::ARCH.to_string()),
-        ("request-traffic-type".to_string(), "prod".to_string()),
-        ("User-Agent".to_string(), "codebuddy2api-rs/2.0".to_string()),
-    ];
-    headers.push((
-        "Accept".to_string(),
-        if stream {
-            "text/event-stream".to_string()
-        } else {
-            "application/json".to_string()
-        },
-    ));
-    if info.host_variant.contains("SOLO") {
-        headers.push(("x-trae-work".to_string(), "1".to_string()));
-    }
-    headers
+    obj.insert(
+        "messages".to_string(),
+        normalize_messages(chat.get("messages").unwrap_or(&json!([]))),
+    );
+
+    let raw_model = chat
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "deepseek-v4-flash".to_string());
+    let (config_name, model_name) = resolve_model(&raw_model);
+
+    normalize_tool_choice(&mut obj);
+    normalize_tools(&mut obj);
+
+    // llm_utils_chat 必填字段
+    obj.insert("config_name".to_string(), json!(config_name));
+    obj.insert("model_name".to_string(), json!(model_name));
+    obj.insert("model".to_string(), json!(config_name));
+    obj.insert("stream".to_string(), json!(true));
+    obj.insert(
+        "function".to_string(),
+        json!(function_for_model(&raw_model)),
+    );
+    // max_tokens：尊重客户端值，缺省 4096（上游必需）
+    let max_tokens = obj
+        .get("max_tokens")
+        .or_else(|| obj.get("max_completion_tokens"))
+        .and_then(|v| v.as_u64())
+        .filter(|n| *n > 0)
+        .map(|n| json!(n))
+        .unwrap_or_else(|| json!(4096));
+    obj.insert("max_tokens".to_string(), max_tokens);
+
+    obj.insert("conversation_id".to_string(), json!(gen_uuid_like()));
+    obj.insert("user_id".to_string(), json!(info.user_id));
+    obj.insert("session_id".to_string(), json!(gen_uuid_like()));
+    obj.insert("device_id".to_string(), json!(info.device_id));
+    obj.insert("machine_id".to_string(), json!(info.machine_id));
+    obj.insert("project_id".to_string(), json!(gen_uuid_like()));
+    obj.insert("workspace_id".to_string(), json!("e04cdd"));
+    // 上游必填；168000 是实测可用值（缺失或 1M 均 4001）
+    obj.insert("prompt_max_tokens".to_string(), json!(PROMPT_MAX_TOKENS));
+    obj.insert("mode".to_string(), json!("FunctionCall"));
+    obj.insert("ide_version".to_string(), json!(ide_version()));
+    obj.insert("ide_version_code".to_string(), json!(ide_version_code()));
+    obj.insert("app_id".to_string(), json!(app_id()));
+    obj.insert("package_type".to_string(), json!("stable_cn"));
+
+    Value::Object(obj)
 }
 
-fn uuid_like() -> String {
+fn app_id() -> String {
+    std::env::var("TRAE_APP_ID").unwrap_or_else(|_| DEFAULT_APP_ID.to_string())
+}
+
+fn ide_version() -> String {
+    std::env::var("TRAE_IDE_VERSION").unwrap_or_else(|_| DEFAULT_IDE_VERSION.to_string())
+}
+
+fn ide_version_code() -> String {
+    std::env::var("TRAE_IDE_VERSION_CODE").unwrap_or_else(|_| DEFAULT_IDE_VERSION_CODE.to_string())
+}
+
+fn gen_uuid_like() -> String {
     format!(
         "{}-{}-{}-{}-{}",
         crate::rand_hex(4),
@@ -261,30 +362,63 @@ fn uuid_like() -> String {
     )
 }
 
-/// `app_version_code` 是 int64（Trae 后端强类型校验）。
+/// 构造发往 Trae 的请求头（照搬真机验证的头集合）。
 ///
-/// ⚠️ 该值需与 Trae 客户端版本匹配，否则上游返回 4001（param is invalid）。
-/// 默认值来自本机 Trae CN 3.3.99 的探测；用 `TRAE_APP_VERSION_CODE` 可覆盖。
-/// 若持续 4001，请从抓包中读取真实值后通过环境变量传入。
-fn app_version_code_i64() -> i64 {
-    std::env::var("TRAE_APP_VERSION_CODE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(202509150)
-}
+/// 关键：鉴权用 **`x-ide-token` 裸 JWT**，不发 `Authorization`。
+pub fn build_headers(info: &TraeAuthInfo, _stream: bool) -> Vec<(String, String)> {
+    let token = &info.token;
+    let trace_id = format!("00-{}-{}-01", gen_uuid_like(), gen_uuid_like());
+    let flow_traceparent = format!(
+        "04-{}-{}-01",
+        &trace_id[3..trace_id.len().min(35)],
+        gen_uuid_like()
+    );
+    let request_id = format!("req_{}", gen_uuid_like());
 
-/// `x-app-version-code` 头：日期型版本号字符串。
-fn app_version_code() -> String {
-    std::env::var("TRAE_APP_VERSION_CODE").unwrap_or_else(|_| "20250915".to_string())
-}
-
-fn ide_version() -> String {
-    std::env::var("TRAE_IDE_VERSION").unwrap_or_else(|_| DEFAULT_IDE_VERSION.to_string())
-}
-
-/// `x-ide-version-code`：同样按日期型版本号校验。
-fn ide_version_code() -> String {
-    std::env::var("TRAE_IDE_VERSION_CODE").unwrap_or_else(|_| "20250915".to_string())
+    vec![
+        ("content-type".to_string(), "application/json".to_string()),
+        ("accept".to_string(), "*/*".to_string()),
+        (
+            "accept-encoding".to_string(),
+            "gzip, deflate, br, zstd".to_string(),
+        ),
+        ("user-agent".to_string(), "TraeClient/TTNet".to_string()),
+        // 鉴权：裸 JWT，不能带 "Cloud-IDE-JWT " 前缀
+        ("x-ide-token".to_string(), token.clone()),
+        ("x-app-id".to_string(), app_id()),
+        ("x-app-version".to_string(), "default".to_string()),
+        ("x-app-version-code".to_string(), ide_version_code()),
+        ("x-ide-version".to_string(), ide_version()),
+        ("x-ide-version-code".to_string(), ide_version_code()),
+        ("x-ide-version-type".to_string(), "stable".to_string()),
+        ("x-device-type".to_string(), device_type().to_string()),
+        ("x-device-brand".to_string(), "CREFG-XX".to_string()),
+        ("x-device-cpu".to_string(), "Intel".to_string()),
+        ("x-device-id".to_string(), info.device_id.clone()),
+        ("x-machine-id".to_string(), info.machine_id.clone()),
+        (
+            "x-os-version".to_string(),
+            "Windows 11 Home China".to_string(),
+        ),
+        ("request-traffic-type".to_string(), "prod".to_string()),
+        ("package-type".to_string(), "stable_cn".to_string()),
+        ("x-lgw-req-sdk-type".to_string(), "3".to_string()),
+        ("x-lscbd-aid".to_string(), "787976".to_string()),
+        ("x-lscbd-platform".to_string(), "windows".to_string()),
+        ("x-ss-dp".to_string(), "787976".to_string()),
+        ("app-version".to_string(), ide_version()),
+        (
+            "x-custom-trace-id".to_string(),
+            trace_id[..trace_id.len().min(16)].to_string(),
+        ),
+        ("x-flow-traceparent".to_string(), flow_traceparent),
+        ("x-tt-trace-id".to_string(), trace_id),
+        ("x-request-id".to_string(), request_id),
+        (
+            "referer".to_string(),
+            format!("{}{}", DEFAULT_CHAT_HOST, AGENT_PATH),
+        ),
+    ]
 }
 
 fn device_type() -> &'static str {
@@ -297,10 +431,14 @@ fn device_type() -> &'static str {
 }
 
 /// Trae 错误码 → HTTP 状态码。
+///
+/// `4001`（param is invalid / model config mismatch）是**请求级**错误，
+/// 与账号无关：换账号只会复现同样错误并耗尽账号池。这里统一映射为 400。
 pub fn error_code_to_http(code: &str) -> u16 {
     match code {
         "1001" => 401,
-        "1005" | "4008" => 402,
+        "1005" => 402,
+        "4008" => 429,
         "4010" => 403,
         "4017" => 403,
         "4001" | "4023" => 400,
@@ -315,14 +453,14 @@ pub fn error_code_to_http(code: &str) -> u16 {
 
 /// 把 Trae 私有 SSE 事件转成标准 OpenAI Chat chunk 的状态机。
 ///
-/// 实测（Trae CN，2026-10）的上游 SSE 形状是：
+/// 实测线格式（Trae CN）：
 /// ```text
 /// id:1
-/// event:error
-/// data:{"code":4001,"message":"..."}
+/// event:output
+/// data:{"response":"hello","reasoning_content":"...","tool_calls":[...]}
+///
 /// ```
-/// 即**事件名在 `event:` 行**，`data:` 是纯 JSON 载荷（不含 type 字段）。
-/// 兼容实现也接受 event 名来自载荷内的 `type`/`event`/`event_type` 字段。
+/// 事件名**只从 `event:` 行取**；文本增量在 `response` 字段。
 pub struct TraeEventConverter {
     model: String,
     id: String,
@@ -330,8 +468,10 @@ pub struct TraeEventConverter {
     started: bool,
     finish_reason: Option<String>,
     usage: Option<Value>,
-    /// 已推送的 tool_calls 下标
     pending_event: Option<String>,
+    /// 已见过的 tool_call 下标（Trae 把 id/name 与 arguments 拆成多个增量块，
+    /// 首个块给出 id/name，后续块只带 arguments）
+    seen_tool_calls: std::collections::BTreeSet<i64>,
     pub emitted_output: bool,
     pub error: Option<(String, String)>, // (message, code)
 }
@@ -346,6 +486,7 @@ impl TraeEventConverter {
             finish_reason: None,
             usage: None,
             pending_event: None,
+            seen_tool_calls: std::collections::BTreeSet::new(),
             emitted_output: false,
             error: None,
         }
@@ -355,14 +496,13 @@ impl TraeEventConverter {
     pub fn feed_line(&mut self, line: &str) -> String {
         let line = line.trim();
         if line.is_empty() || line.starts_with(':') {
-            return String::new(); // 空行/注释（keepalive）
+            return String::new();
         }
-        // `id:` 行忽略
         if let Some(rest) = line.strip_prefix("id:") {
             let _ = rest;
             return String::new();
         }
-        // `event:` 行记录事件名，等随后的 data 行一起处理
+        // 事件名只从 event: 行取
         if let Some(rest) = line.strip_prefix("event:") {
             self.pending_event = Some(rest.trim().to_string());
             return String::new();
@@ -374,96 +514,60 @@ impl TraeEventConverter {
         if rest == "[DONE]" {
             return String::new();
         }
-        let Ok(chunk) = serde_json::from_str::<Value>(rest) else {
-            return String::new();
+        let chunk: Value = if rest.is_empty() {
+            json!({})
+        } else {
+            match serde_json::from_str::<Value>(rest) {
+                Ok(v) => v,
+                Err(_) => return String::new(),
+            }
         };
-        // 事件名优先级：载荷内的 type 字段 > 前一行 event:
-        let event_name = chunk
-            .get("type")
-            .or_else(|| chunk.get("event"))
-            .or_else(|| chunk.get("event_type"))
-            .or_else(|| chunk.get("eventType"))
-            .and_then(|t| t.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| self.pending_event.take());
-        self.process(event_name.as_deref().unwrap_or(""), &chunk)
+        let event = self.pending_event.take().unwrap_or_default();
+        self.process(&event, &chunk)
     }
 
     fn process(&mut self, event_type: &str, chunk: &Value) -> String {
-        let normalized = normalize_event_name(event_type);
-
-        match normalized.as_str() {
-            "output" | "text" => {
+        match normalize_event_name(event_type).as_str() {
+            // 文本增量在 response 字段；reasoning_content 为思维链
+            "output" => {
                 let text = chunk
-                    .get("content")
+                    .get("response")
                     .and_then(|c| c.as_str())
-                    .or_else(|| chunk.get("response").and_then(|c| c.as_str()))
+                    .or_else(|| chunk.get("content").and_then(|c| c.as_str()))
                     .unwrap_or("");
-                if text.is_empty() {
-                    return String::new();
-                }
-                self.emitted_output = true;
-                self.text_chunk(text)
-            }
-            "reasoning" => {
-                let text = chunk
-                    .get("reasoning")
+                let reasoning = chunk
+                    .get("reasoning_content")
                     .and_then(|c| c.as_str())
-                    .or_else(|| chunk.get("reasoning_content").and_then(|c| c.as_str()))
-                    .or_else(|| chunk.get("thought").and_then(|c| c.as_str()))
                     .unwrap_or("");
-                if text.is_empty() {
-                    return String::new();
-                }
-                self.emitted_output = true;
-                // 用 reasoning_content 字段透出思维链（OpenAI 兼容客户端多半忽略）
-                self.delta_chunk(json!({"reasoning_content": text}))
-            }
-            "tool_calls" => {
-                let Some(calls) = chunk.get("tool_calls").and_then(|c| c.as_array()) else {
-                    return String::new();
-                };
                 let mut out = String::new();
-                for (i, tc) in calls.iter().enumerate() {
-                    let name = tc
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .or_else(|| tc.pointer("/function/name").and_then(|n| n.as_str()))
-                        .or_else(|| tc.get("tool_name").and_then(|n| n.as_str()))
-                        .unwrap_or("");
-                    let args = tc
-                        .get("params")
-                        .or_else(|| tc.get("arguments"))
-                        .or_else(|| tc.get("input"))
-                        .or_else(|| tc.pointer("/function/arguments"))
-                        .map(stringify_args)
-                        .unwrap_or_else(|| "{}".to_string());
-                    let id = tc
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let id = if id.is_empty() {
-                        format!("call_{}", crate::rand_hex(8))
-                    } else {
-                        id
-                    };
-                    let index = tc.get("index").and_then(|v| v.as_i64()).unwrap_or(i as i64);
+                if !text.is_empty() {
                     self.emitted_output = true;
-                    out.push_str(&self.delta_chunk(json!({
-                        "tool_calls": [{
-                            "index": index,
-                            "id": id,
-                            "type": "function",
-                            "function": {"name": name, "arguments": args},
-                        }]
-                    })));
+                    out.push_str(&self.delta_chunk(json!({"content": text})));
+                }
+                if !reasoning.is_empty() {
+                    self.emitted_output = true;
+                    out.push_str(&self.delta_chunk(json!({"reasoning_content": reasoning})));
+                }
+                if let Some(tcs) = chunk.get("tool_calls").and_then(|t| t.as_array()) {
+                    out.push_str(&self.tool_calls_chunk(tcs));
                 }
                 out
             }
+            // create_agent_task 旧格式，保留兼容
+            "thought" => {
+                let text = chunk
+                    .get("thought")
+                    .and_then(|c| c.as_str())
+                    .or_else(|| chunk.get("reasoning_content").and_then(|c| c.as_str()))
+                    .unwrap_or("");
+                if text.is_empty() {
+                    return String::new();
+                }
+                self.emitted_output = true;
+                self.delta_chunk(json!({"reasoning_content": text}))
+            }
             "token_usage" => {
-                let usage = chunk.get("data").cloned().unwrap_or_else(|| chunk.clone());
-                self.usage = Some(map_usage(&usage));
+                self.usage = Some(map_usage(chunk));
                 String::new()
             }
             "done" => {
@@ -474,6 +578,10 @@ impl TraeEventConverter {
                         .unwrap_or("stop")
                         .to_string(),
                 );
+                self.final_chunk()
+            }
+            "turn_completion" => {
+                self.finish_reason = Some("stop".to_string());
                 self.final_chunk()
             }
             "error" => {
@@ -493,16 +601,71 @@ impl TraeEventConverter {
                 let status = error_code_to_http(&code);
                 format!(
                     "data: {}\n\n",
-                    json!({"error": {"message": message, "type": "upstream_error", "code": status}})
+                    json!({"error": {"message": message, "type": "api_error", "code": status}})
                 )
             }
-            // queue_wait / metadata / timing_cost / progress 等：忽略
             _ => String::new(),
         }
     }
 
-    fn text_chunk(&mut self, text: &str) -> String {
-        self.delta_chunk(json!({"content": text}))
+    fn tool_calls_chunk(&mut self, calls: &[Value]) -> String {
+        let mut out = String::new();
+        for (i, tc) in calls.iter().enumerate() {
+            // Trae 用 function_call 子对象，子字段 namespace/partial_arguments 需剥离
+            let fc = tc.get("function_call").or_else(|| tc.get("function"));
+            let name = fc
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| tc.get("name").and_then(|n| n.as_str()))
+                .unwrap_or("");
+            let args = fc
+                .and_then(|f| f.get("arguments"))
+                .map(|a| match a {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .or_else(|| {
+                    tc.get("params").map(|p| match p {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                })
+                .unwrap_or_default();
+            let index = tc.get("index").and_then(|v| v.as_i64()).unwrap_or(i as i64);
+            let first_seen = self.seen_tool_calls.insert(index);
+            // id 只在首个块给出；后续块为空
+            let id = tc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let id = match (id, first_seen) {
+                (Some(id), _) if !id.is_empty() => id,
+                (_, true) => format!("call_{}", crate::rand_hex(8)),
+                (_, false) => String::new(),
+            };
+
+            // 首个块即使 name/args 为空也要发（建立 tool_call 槽位）；后续块只在有内容时发
+            if !first_seen && name.is_empty() && args.is_empty() && id.is_empty() {
+                continue;
+            }
+            self.emitted_output = true;
+            let mut function = serde_json::Map::new();
+            if !name.is_empty() {
+                function.insert("name".to_string(), json!(name));
+            }
+            function.insert("arguments".to_string(), json!(args));
+            out.push_str(&self.delta_chunk(json!({
+                "tool_calls": [{
+                    "index": index,
+                    "id": id,
+                    "type": "function",
+                    "function": function,
+                }]
+            })));
+        }
+        out
     }
 
     fn delta_chunk(&mut self, delta: Value) -> String {
@@ -525,7 +688,10 @@ impl TraeEventConverter {
     }
 
     fn final_chunk(&mut self) -> String {
-        let reason = self.finish_reason.clone().unwrap_or_else(|| "stop".to_string());
+        let reason = self
+            .finish_reason
+            .clone()
+            .unwrap_or_else(|| "stop".to_string());
         let mut out = String::new();
         out.push_str(&format!(
             "data: {}\n\n",
@@ -553,20 +719,13 @@ impl TraeEventConverter {
 }
 
 fn normalize_event_name(name: &str) -> String {
-    let lower = name.to_lowercase();
+    let lower = name.trim().to_lowercase();
     match lower.as_str() {
         "modelconfig" => "model_config".to_string(),
         "planitem" => "plan_item".to_string(),
         "responsedone" | "response_done" | "streamdone" | "stream_done" => "done".to_string(),
         "tokenusage" => "token_usage".to_string(),
         "requestwaitingqueue" => "request_wait_in_queue".to_string(),
-        other => other.to_string(),
-    }
-}
-
-fn stringify_args(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
         other => other.to_string(),
     }
 }
@@ -599,6 +758,7 @@ fn map_usage(usage: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn conv() -> TraeEventConverter {
         TraeEventConverter::new("glm-5.2")
@@ -612,54 +772,112 @@ mod tests {
             .collect()
     }
 
+    fn fake_info() -> TraeAuthInfo {
+        TraeAuthInfo {
+            token: "jwt-abc".to_string(),
+            user_id: "89529830872176".to_string(),
+            device_id: "12345".to_string(),
+            machine_id: "deadbeef".to_string(),
+            expires_at_ms: 0,
+            host_variant: "Trae CN".to_string(),
+            storage_path: PathBuf::from("/fake/storage.json"),
+        }
+    }
+
+    /// 实测线格式：文本增量在 response 字段，事件名只从 event: 行取。
     #[test]
-    fn test_text_event_new_format() {
+    fn test_real_wire_output_event() {
         let mut c = conv();
-        let out = c.feed_line(r#"data: {"type":"text","content":"hello"}"#);
+        c.feed_line("id:1");
+        c.feed_line("event:output");
+        let out = c.feed_line(r#"data:{"response":"hello"}"#);
         let events = data_events(&out);
         assert_eq!(events[0]["choices"][0]["delta"]["content"], "hello");
         assert_eq!(events[0]["choices"][0]["delta"]["role"], "assistant");
         assert!(c.emitted_output);
     }
 
+    /// 空 JSON 的 output 块是真实世界常态，不应产生任何输出。
     #[test]
-    fn test_text_event_old_format() {
+    fn test_empty_output_chunk_ignored() {
         let mut c = conv();
-        let out = c.feed_line(r#"data: {"type":"output","response":"legacy"}"#);
-        let events = data_events(&out);
-        assert_eq!(events[0]["choices"][0]["delta"]["content"], "legacy");
+        c.feed_line("event:output");
+        assert_eq!(c.feed_line("data:{}"), "");
     }
 
     #[test]
-    fn test_reasoning_event() {
+    fn test_output_with_reasoning_and_tools() {
         let mut c = conv();
-        let out = c.feed_line(r#"data: {"type":"reasoning","reasoning":"thinking..."}"#);
+        c.feed_line("event:output");
+        let out = c.feed_line(
+            r#"data:{"response":"txt","reasoning_content":"think","tool_calls":[{"index":0,"id":"c1","function_call":{"name":"Bash","arguments":"{\"cmd\":\"ls\"}"}}]}"#,
+        );
+        let events = data_events(&out);
+        assert_eq!(events[0]["choices"][0]["delta"]["content"], "txt");
+        assert_eq!(events[1]["choices"][0]["delta"]["reasoning_content"], "think");
+        let tc = &events[2]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(tc["id"], "c1");
+        assert_eq!(tc["function"]["name"], "Bash");
+    }
+
+    /// 实测：Trae 把 tool_call 拆成多个增量块——首块给 id+name，次块只给 arguments。
+    /// 后续块不能覆盖首块的 name（回归：曾导致 name 变空）。
+    #[test]
+    fn test_tool_calls_split_across_chunks() {
+        let mut c = conv();
+        c.feed_line("event:output");
+        let out1 = c.feed_line(
+            r#"data:{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function_call":{"name":"Bash","arguments":"","partial_arguments":null,"namespace":null}}]}"#,
+        );
+        c.feed_line("event:output");
+        let out2 = c.feed_line(
+            r#"data:{"tool_calls":[{"index":0,"id":"","type":"function","function_call":{"name":"","arguments":"{\"cmd\": \"ls -la\"}","partial_arguments":null,"namespace":null}}]}"#,
+        );
+
+        let e1 = data_events(&out1);
+        let tc1 = &e1[0]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(tc1["id"], "call_abc");
+        assert_eq!(tc1["function"]["name"], "Bash");
+
+        let e2 = data_events(&out2);
+        let tc2 = &e2[0]["choices"][0]["delta"]["tool_calls"][0];
+        // 第二块 name 为空，不应覆盖首块已建立的名字
+        assert!(tc2["function"].get("name").is_none());
+        assert_eq!(tc2["function"]["arguments"], "{\"cmd\": \"ls -la\"}");
+    }
+
+    /// payload 里的 type 字段不参与事件判定（与参考实现一致）。
+    #[test]
+    fn test_payload_type_field_ignored() {
+        let mut c = conv();
+        c.feed_line("event:output");
+        let out = c.feed_line(r#"data:{"type":"text","response":"via response"}"#);
+        let events = data_events(&out);
+        assert_eq!(
+            events[0]["choices"][0]["delta"]["content"],
+            "via response"
+        );
+    }
+
+    #[test]
+    fn test_thought_legacy_event() {
+        let mut c = conv();
+        c.feed_line("event:thought");
+        let out = c.feed_line(r#"data:{"thought":"legacy thinking"}"#);
         let events = data_events(&out);
         assert_eq!(
             events[0]["choices"][0]["delta"]["reasoning_content"],
-            "thinking..."
+            "legacy thinking"
         );
-    }
-
-    #[test]
-    fn test_tool_calls_event() {
-        let mut c = conv();
-        let out = c.feed_line(
-            r#"data: {"type":"tool_calls","tool_calls":[{"id":"c1","name":"Bash","params":{"cmd":"ls"}}]}"#,
-        );
-        let events = data_events(&out);
-        let tc = &events[0]["choices"][0]["delta"]["tool_calls"][0];
-        assert_eq!(tc["id"], "c1");
-        assert_eq!(tc["function"]["name"], "Bash");
-        let args: Value = serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(args, json!({"cmd": "ls"}));
     }
 
     #[test]
     fn test_token_usage_and_done() {
         let mut c = conv();
-        c.feed_line(r#"data: {"type":"token_usage","data":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#);
-        let out = c.feed_line(r#"data: {"type":"done","finish_reason":"stop"}"#);
+        c.feed_line("event:token_usage");
+        c.feed_line(r#"data:{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}"#);
+        c.feed_line("event:done");
+        let out = c.feed_line(r#"data:{"finish_reason":"stop"}"#);
         let events = data_events(&out);
         let last = events.last().unwrap();
         assert_eq!(last["choices"][0]["finish_reason"], "stop");
@@ -669,19 +887,32 @@ mod tests {
     }
 
     #[test]
+    fn test_turn_completion_legacy() {
+        let mut c = conv();
+        c.feed_line("event:turn_completion");
+        let out = c.feed_line("data:{}");
+        assert!(out.contains("\"finish_reason\":\"stop\""));
+        assert!(out.contains("data: [DONE]"));
+    }
+
+    #[test]
     fn test_error_event_maps_status() {
         let mut c = conv();
-        let out = c.feed_line(r#"data: {"type":"error","code":4008,"message":"quota"}"#);
+        c.feed_line("event:error");
+        let out = c.feed_line(
+            r#"data:{"code":4001,"message":"model config is empty"}"#,
+        );
         let events = data_events(&out);
-        assert_eq!(events[0]["error"]["code"], 402);
-        assert_eq!(events[0]["error"]["message"], "quota");
+        assert_eq!(events[0]["error"]["code"], 400);
+        assert_eq!(events[0]["error"]["message"], "model config is empty");
         assert!(c.error.is_some());
     }
 
     #[test]
     fn test_finish_is_idempotent() {
         let mut c = conv();
-        c.feed_line(r#"data: {"type":"done"}"#);
+        c.feed_line("event:done");
+        c.feed_line("data:{}");
         assert_eq!(c.finish(), "");
         let mut c2 = conv();
         assert!(c2.finish().contains("[DONE]"));
@@ -691,52 +922,10 @@ mod tests {
     fn test_comment_and_unknown_ignored() {
         let mut c = conv();
         assert_eq!(c.feed_line(": keepalive"), "");
-        assert_eq!(c.feed_line(r#"data: {"type":"queue_wait","position":3}"#), "");
-    }
-
-    /// 实测格式：事件名在 `event:` 行，data 是纯 JSON（不含 type 字段）。
-    #[test]
-    fn test_real_wire_format_event_line() {
-        let mut c = conv();
-        // id: / event: / data: 三行一组
-        assert_eq!(c.feed_line("id:1"), "");
-        assert_eq!(c.feed_line("event:output"), "");
-        let out = c.feed_line(r#"data:{"content":"hello"}"#);
-        let events = data_events(&out);
-        assert_eq!(events[0]["choices"][0]["delta"]["content"], "hello");
-    }
-
-    #[test]
-    fn test_real_wire_format_error_event() {
-        let mut c = conv();
-        c.feed_line("id:1");
-        c.feed_line("event:error");
-        let out = c.feed_line(
-            r#"data:{"code":4001,"message":"We're sorry, the param is invalid.","extra":null}"#,
-        );
-        let events = data_events(&out);
-        assert_eq!(events[0]["error"]["code"], 400);
-        assert!(c.error.is_some());
-    }
-
-    #[test]
-    fn test_real_wire_format_done_event() {
-        let mut c = conv();
-        c.feed_line("id:2");
-        c.feed_line("event:done");
-        let out = c.feed_line(r#"data:{"finish_reason":"stop"}"#);
-        assert!(out.contains("[DONE]"));
-        assert_eq!(c.finish(), ""); // done 后再 finish 应幂等
-    }
-
-    /// event 名在 `event:` 行、但载荷里也带 type 时，以载荷为准。
-    #[test]
-    fn test_payload_type_takes_precedence() {
-        let mut c = conv();
-        c.feed_line("event:unknown_thing");
-        let out = c.feed_line(r#"data:{"type":"text","content":"via type"}"#);
-        let events = data_events(&out);
-        assert_eq!(events[0]["choices"][0]["delta"]["content"], "via type");
+        c.feed_line("event:metadata");
+        assert_eq!(c.feed_line(r#"data:{"session_id":"x"}"#), "");
+        c.feed_line("event:timing_cost");
+        assert_eq!(c.feed_line(r#"data:{"cost":1}"#), "");
     }
 
     #[test]
@@ -746,40 +935,169 @@ mod tests {
             {"role": "developer", "content": [{"type": "text", "text": "sys"}]},
         ]);
         let out = normalize_messages(&msgs);
-        assert_eq!(out[0]["content"], json!([{"type": "text", "text": "plain string"}]));
+        assert_eq!(
+            out[0]["content"],
+            json!([{"type": "text", "text": "plain string"}])
+        );
         assert_eq!(out[1]["role"], "system");
         assert_eq!(out[1]["content"][0]["text"], "sys");
     }
 
     #[test]
-    fn test_build_request_body_injects_required_fields() {
+    fn test_normalize_messages_tool_calls_renamed() {
+        let msgs = json!([
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "Bash", "arguments": "{}"}},
+                {"id": "c2", "type": "function", "function": {"name": "", "arguments": "{}"}},
+            ]},
+        ]);
+        let out = normalize_messages(&msgs);
+        let tcs = out[0]["tool_calls"].as_array().unwrap();
+        // 空名的被丢弃，function → function_call
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0]["function_call"]["name"], "Bash");
+        assert!(tcs[0].get("function").is_none());
+    }
+
+    /// 关键回归：必填字段齐全，尤其是 prompt_max_tokens。
+    #[test]
+    fn test_build_request_body_required_fields() {
         let chat = json!({
-            "model": "gpt-4o",
+            "model": "deepseek-v4-flash",
             "messages": [{"role": "user", "content": "hi"}],
-            "temperature": 0.5,
         });
-        let body = build_request_body(&chat, DEFAULT_FUNCTION);
-        assert_eq!(body["function"], "solo_work_lite");
-        assert_eq!(body["model"], "DeepSeek-V4-Pro");
-        assert_eq!(body["config_name"], "DeepSeek-V4-Pro");
+        let body = build_request_body(&chat, &fake_info());
+        assert_eq!(body["config_name"], "DeepSeek-V4-Flash");
+        assert_eq!(body["model_name"], "deepseek_v4_flash__dev");
+        assert_eq!(body["prompt_max_tokens"], 168000);
         assert_eq!(body["stream"], true);
-        assert_eq!(body["temperature"], 0.5);
+        assert_eq!(body["function"], "solo_work_lite");
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["mode"], "FunctionCall");
+        assert_eq!(body["workspace_id"], "e04cdd");
+        assert_eq!(body["package_type"], "stable_cn");
+        assert_eq!(body["user_id"], "89529830872176");
+        assert_eq!(body["device_id"], "12345");
+        assert_eq!(body["machine_id"], "deadbeef");
+        assert_eq!(body["ide_version"], "0.1.50");
+        assert_eq!(body["ide_version_code"], "20260811");
+        // 必填的 id 字段都存在且非空
+        for k in ["conversation_id", "session_id", "project_id"] {
+            assert!(
+                body[k].as_str().map(|s| !s.is_empty()).unwrap_or(false),
+                "{k} 应非空"
+            );
+        }
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
     }
 
     #[test]
-    fn test_model_alias_passthrough() {
-        assert_eq!(resolve_model_name("kimi-k3"), "kimi-k3");
-        assert_eq!(resolve_model_name("AUTO"), "glm-5.2");
-        assert_eq!(resolve_model_name("gpt-4o"), "DeepSeek-V4-Pro");
+    fn test_model_view_function_selection() {
+        // deepseek-v4.1-flash 只在 solo_agent 下可用
+        assert_eq!(function_for_model("deepseek-v4.1-flash"), "solo_agent");
+        assert_eq!(function_for_model("doubao-seed-code"), "solo_agent");
+        assert_eq!(function_for_model("glm-5.2"), "solo_work_lite");
+        assert_eq!(function_for_model("deepseek-v4-flash"), "solo_work_lite");
+    }
+
+    #[test]
+    fn test_model_resolution() {
+        assert_eq!(
+            resolve_model("deepseek-v4-flash"),
+            ("DeepSeek-V4-Flash".to_string(), "deepseek_v4_flash__dev".to_string())
+        );
+        assert_eq!(
+            resolve_model("kimi-k3"),
+            ("kimi-k3".to_string(), "kimi-k3__dev".to_string())
+        );
+        // 未收录模型：原样透传 + __dev 后缀
+        assert_eq!(
+            resolve_model("brand-new-model"),
+            ("brand-new-model".to_string(), "brand-new-model__dev".to_string())
+        );
+        // 大小写不敏感
+        assert_eq!(resolve_model("DeepSeek-V4-Flash").0, "DeepSeek-V4-Flash");
+    }
+
+    /// 关键回归：鉴权头是裸 JWT 的 x-ide-token，不出现 Authorization。
+    #[test]
+    fn test_headers_use_bare_jwt_not_authorization() {
+        let headers = build_headers(&fake_info(), true);
+        let map: std::collections::HashMap<_, _> = headers.iter().cloned().collect();
+        assert_eq!(map.get("x-ide-token").unwrap(), "jwt-abc");
+        assert!(!headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization")));
+        assert!(!map.get("x-ide-token").unwrap().starts_with("Cloud-IDE-JWT"));
+        // 版本号在 header
+        assert_eq!(map.get("x-app-version-code").unwrap(), "20260811");
+        assert_eq!(map.get("x-ide-version-code").unwrap(), "20260811");
+        assert_eq!(map.get("x-ide-version").unwrap(), "0.1.50");
+        // 关键头存在
+        for k in [
+            "x-app-id",
+            "x-device-id",
+            "x-machine-id",
+            "referer",
+            "x-flow-traceparent",
+            "user-agent",
+        ] {
+            assert!(map.contains_key(k), "缺少头 {k}");
+        }
+        assert_eq!(map.get("user-agent").unwrap(), "TraeClient/TTNet");
+    }
+
+    #[test]
+    fn test_tool_parameters_serialized_to_string() {
+        let chat = json!({
+            "model": "glm-5.2",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "Bash",
+                "description": "run",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+            }}],
+        });
+        let body = build_request_body(&chat, &fake_info());
+        // parameters 必须是 JSON 字符串
+        assert!(body["tools"][0]["function"]["parameters"].is_string());
     }
 
     #[test]
     fn test_error_code_mapping() {
         assert_eq!(error_code_to_http("1001"), 401);
-        assert_eq!(error_code_to_http("4008"), 402);
         assert_eq!(error_code_to_http("4001"), 400);
-        assert_eq!(error_code_to_http("4011"), 429);
+        assert_eq!(error_code_to_http("4023"), 400);
+        assert_eq!(error_code_to_http("4008"), 429);
         assert_eq!(error_code_to_http("9999"), 502);
+    }
+}
+
+#[cfg(test)]
+mod agg_tests {
+    use super::*;
+
+    /// 复现完整链路：分片 tool_calls 私有 SSE → 转换 → 标准聚合。
+    #[test]
+    fn test_split_tool_calls_through_aggregation() {
+        let mut conv = TraeEventConverter::new("trae");
+        let mut out = String::new();
+        for line in [
+            "id:1", "event:output",
+            "data:{}",
+            "id:2", "event:output",
+            r#"data:{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function_call":{"name":"Bash","arguments":"","partial_arguments":null,"namespace":null}}]}"#,
+            "id:3", "event:output",
+            r#"data:{"tool_calls":[{"index":0,"id":"","type":"function","function_call":{"name":"","arguments":"{\"cmd\": \"ls -la\"}","partial_arguments":null,"namespace":null}}]}"#,
+            "id:4", "event:done", r#"data:{"finish_reason":"stop"}"#,
+        ] {
+            out.push_str(&conv.feed_line(line));
+        }
+        out.push_str(&conv.finish());
+
+        let agg = crate::upstream::aggregate_openai_sse(out.as_bytes());
+        let tc = &agg["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(tc["function"]["name"], "Bash", "聚合后 name 应保留；实际: {agg}");
+        assert_eq!(tc["id"], "call_abc");
+        assert_eq!(tc["function"]["arguments"], "{\"cmd\": \"ls -la\"}");
+        assert_eq!(agg["choices"][0]["finish_reason"], "tool_calls");
     }
 }
