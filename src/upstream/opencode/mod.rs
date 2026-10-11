@@ -10,6 +10,7 @@ use serde_json::Value;
 use super::{passthrough_stream, ByteStream, Upstream, UpstreamRequest};
 
 pub mod auth;
+pub mod zen_free;
 
 /// 一个本地 OpenCode 里配置的、标准 OpenAI 兼容的云服务商。
 pub struct OpenCodeKeyUpstream {
