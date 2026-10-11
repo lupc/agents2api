@@ -204,6 +204,7 @@ async fn main() {
 
     // 载入上次同步的模型目录快照（models() 立即消费；参考实现：网关启动时也自动同步一次）
     crate::upstream::codebuddy_catalog::load_catalog_snapshot(&data_dir);
+    crate::upstream::trae::catalog::load_catalog_snapshot(&data_dir);
 
     // 每日定时模型同步（应用运行期间每天 HH:MM 自动触发一次）
     {

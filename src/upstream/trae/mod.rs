@@ -9,6 +9,7 @@
 //! 主线端点为 IDE Agent 单请求 `POST {chatHost}/api/agent/v3/llm_utils_chat`。
 
 pub mod auth;
+pub mod catalog;
 pub mod crypto;
 pub mod protocol;
 
@@ -40,24 +41,27 @@ impl TraeUpstream {
         self.cred.info().await
     }
 
-    /// 从 Trae 模型网关拉取真实模型目录。
+    /// 从 Trae 模型网关拉取真实模型目录（batch_get_detail_param）。
     ///
-    /// 端点与请求头来自参考实现（batch_get_detail_param，需 `x-bridge-transport: aha`）。
-    /// 响应结构未完全公开，这里防御性解析：递归收集所有 `config_name` 字符串值；
-    /// 任何失败都返回 Err 由调用方回退。
-    async fn fetch_remote_models(&self) -> Result<Vec<String>, String> {
+    /// 请求形态 = 客户端 Agent 聊天选择器的真实请求（参考实现 2026-09-19 抓包固化）：
+    /// 7 函数 + access_type=0；头需 `x-bridge-transport: aha`。
+    async fn fetch_catalog_raw(&self) -> Result<Value, String> {
         let info = self.info().await?;
         let host = std::env::var("TRAE_MODEL_API_HOST")
             .unwrap_or_else(|_| "https://api5-normal.mchost.guru".to_string());
         let url = format!("{host}/api/ide/v1/batch_get_detail_param");
         let body = serde_json::json!({
-            "functions": ["solo_work_lite", "solo_agent"],
-            "config_names": null,
-            "need_prompt": false,
-            "current_config_info": null,
-            "poly_prompt": true,
-            "mode_type": null,
-            "agent_type": null,
+            "functions": [
+                "builder", "builder_v3", "chat_v3", "code_reviewer",
+                "code_review_summary", "refactor", "solo_agent"
+            ],
+            "agent_type": "solo_agent",
+            "current_config_info": { "config_name": "", "is_custom_model": false },
+            "mode_type": 0,
+            "access_type": 0,
+            "ab_force_vids": "",
+            "ab_autotest_advanced_mode": 0,
+            "show_custom_model": true,
         });
         let mut headers = protocol::build_headers(&info, false);
         headers.push(("x-bridge-transport".to_string(), "aha".to_string()));
@@ -69,7 +73,7 @@ impl TraeUpstream {
             req = req.header(k, v);
         }
         let resp = req
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
             .map_err(|e| format!("请求失败: {e}"))?;
@@ -84,44 +88,10 @@ impl TraeUpstream {
                 text.chars().take(200).collect::<String>()
             ));
         }
-        let v: Value = serde_json::from_str(&text)
-            .map_err(|e| {
-                let head: String = text.chars().take(300).collect();
-                format!("响应解析失败: {e}；原始响应开头: {head:?}")
-            })?;
-        let mut names = Vec::new();
-        collect_config_names(&v, &mut names);
-        names.sort();
-        names.dedup();
-        // 过滤明显非模型的值
-        names.retain(|n| {
-            !n.is_empty()
-                && !n.starts_with("http")
-                && n.len() < 64
-        });
-        Ok(names)
-    }
-}
-
-/// 递归收集 JSON 中所有 `config_name` 字符串值（防御性解析，容忍结构漂移）。
-fn collect_config_names(v: &Value, out: &mut Vec<String>) {
-    match v {
-        Value::Object(m) => {
-            if let Some(Value::String(s)) = m.get("config_name") {
-                if !s.is_empty() {
-                    out.push(s.clone());
-                }
-            }
-            for val in m.values() {
-                collect_config_names(val, out);
-            }
-        }
-        Value::Array(items) => {
-            for i in items {
-                collect_config_names(i, out);
-            }
-        }
-        _ => {}
+        serde_json::from_str(&text).map_err(|e| {
+            let head: String = text.chars().take(300).collect();
+            format!("响应解析失败: {e}；原始响应开头: {head:?}")
+        })
     }
 }
 
@@ -201,20 +171,19 @@ impl Upstream for TraeUpstream {
     }
 
     async fn models(&self) -> Vec<String> {
+        // 已同步远程目录时优先消费（客户端可见性口径），否则内置兜底
+        if let Some(catalog) = catalog::catalog_snapshot() {
+            return catalog.into_iter().map(|m| m.id).collect();
+        }
         DEFAULT_MODELS.iter().map(|s| s.to_string()).collect()
     }
 
-    /// 远程目录（id 级元数据；Trae 目录接口的倍率/档位字段未逆向，先只有 id）。
+    /// 远程目录：batch_get_detail_param 全量解析（倍率/档位/上下文/图片），
+    /// 按客户端可见性规则过滤；失败返回 Err 由调用方回退。
     async fn sync_catalog(&self) -> Result<Vec<ModelInfo>, String> {
-        let names = self.fetch_remote_models().await?;
-        Ok(names
-            .into_iter()
-            .map(|display| ModelInfo {
-                id: display.to_lowercase(),
-                display,
-                ..Default::default()
-            })
-            .collect())
+        let body = self.fetch_catalog_raw().await?;
+        let text = serde_json::to_string(&body).map_err(|e| e.to_string())?;
+        catalog::parse_official_catalog(&text)
     }
 
     async fn health_info(&self) -> Value {
