@@ -15,7 +15,7 @@ pub mod protocol;
 use futures::StreamExt;
 use serde_json::Value;
 
-use super::{ByteStream, Upstream, UpstreamRequest};
+use super::{ByteStream, ModelInfo, Upstream, UpstreamRequest};
 use auth::{TraeCredential, TraeAuthInfo};
 use protocol::TraeEventConverter;
 
@@ -204,23 +204,17 @@ impl Upstream for TraeUpstream {
         DEFAULT_MODELS.iter().map(|s| s.to_string()).collect()
     }
 
-    /// 模型同步：尝试从 Trae 模型网关拉取真实目录（batch_get_detail_param），
-    /// 失败或为空则回退内置列表。
-    async fn sync_models(&self) -> Vec<String> {
-        match self.fetch_remote_models().await {
-            Ok(list) if !list.is_empty() => {
-                crate::config::log(&format!(
-                    "🔄 Trae 远程模型同步成功：{} 个模型",
-                    list.len()
-                ));
-                list
-            }
-            Err(e) => {
-                crate::config::log(&format!("⚠️ Trae 远程模型同步失败，回退内置列表: {e}"));
-                self.models().await
-            }
-            Ok(_) => self.models().await,
-        }
+    /// 远程目录（id 级元数据；Trae 目录接口的倍率/档位字段未逆向，先只有 id）。
+    async fn sync_catalog(&self) -> Result<Vec<ModelInfo>, String> {
+        let names = self.fetch_remote_models().await?;
+        Ok(names
+            .into_iter()
+            .map(|display| ModelInfo {
+                id: display.to_lowercase(),
+                display,
+                ..Default::default()
+            })
+            .collect())
     }
 
     async fn health_info(&self) -> Value {

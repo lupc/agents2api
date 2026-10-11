@@ -62,6 +62,10 @@ pub fn router(state: AdminState) -> Router<SharedState> {
         .route("/api/models", get(routes::all_models))
         .route("/api/sync", post(routes::sync_models))
         .route("/api/config", get(routes::get_config).put(routes::put_config))
+        .route(
+            "/api/settings",
+            get(routes::get_settings).put(routes::put_settings),
+        )
         .route("/api/checkin/trae", post(routes::checkin_trae))
         .route("/api/checkin/results", get(routes::checkin_results))
         .route("/api/credits/trae", get(routes::credits_trae))

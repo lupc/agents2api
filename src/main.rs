@@ -202,6 +202,46 @@ async fn main() {
         });
     }
 
+    // 载入上次同步的模型目录快照（models() 立即消费；参考实现：网关启动时也自动同步一次）
+    crate::upstream::codebuddy_catalog::load_catalog_snapshot(&data_dir);
+
+    // 每日定时模型同步（应用运行期间每天 HH:MM 自动触发一次）
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                let settings = admin::routes::AdminSettings::load(&st.data_dir);
+                if !settings.daily_sync_enabled {
+                    continue;
+                }
+                let now = chrono::Local::now();
+                let hhmm = now.format("%H:%M").to_string();
+                let today = now.format("%Y-%m-%d").to_string();
+                let has_syncable = st.upstream(Some("codebuddy")).is_some()
+                    || st.upstream(Some("trae")).is_some();
+                if hhmm == settings.daily_sync_time
+                    && settings.last_sync_date != today
+                    && has_syncable
+                {
+                    // 记录日期在前：失败也视为已尝试，明天再试
+                    let mut s = settings.clone();
+                    s.last_sync_date = today;
+                    if s.save(&st.data_dir).is_err() {
+                        continue;
+                    }
+                    config::log("⏰ 每日定时模型同步触发");
+                    let admin_state = crate::admin::AdminState {
+                        app: st.clone(),
+                        data_dir: st.data_dir.clone(),
+                    };
+                    let _ = admin::routes::sync_models_inner(&admin_state).await;
+                }
+            }
+        });
+    }
+
     if !cli.skip_check {
         preflight(&state);
     }

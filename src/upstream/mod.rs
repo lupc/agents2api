@@ -9,6 +9,7 @@
 //!   避免每个 handler 各写一套聚合逻辑。
 
 pub mod codebuddy;
+pub mod codebuddy_catalog;
 pub mod opencode;
 pub mod sse;
 pub mod trae;
@@ -50,14 +51,42 @@ pub trait Upstream: Send + Sync {
     /// 该上游可用的模型 id 列表。
     async fn models(&self) -> Vec<String>;
 
-    /// 模型同步：默认等价 [`Self::models`]；个别上游可覆盖为远程目录拉取
-    /// （如 Trae 的 batch_get_detail_param），失败时回退 [`Self::models`]。
-    async fn sync_models(&self) -> Vec<String> {
-        self.models().await
+    /// 远程模型目录同步：拉取带元数据的完整目录（倍率/档位/上下文/图片）。
+    /// 默认不支持（返回 Err）；支持的上游覆盖之。
+    async fn sync_catalog(&self) -> Result<Vec<ModelInfo>, String> {
+        Err(format!("上游 {} 不支持远程目录同步", self.name()))
     }
 
     /// 健康检查附带的账号/状态信息。
     async fn health_info(&self) -> Value;
+}
+
+/// 目录里的单个模型（对齐参考实现的 `WbModel` 语义）。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ModelInfo {
+    /// 模型 id（客户端请求的 model 字段，小写）
+    pub id: String,
+    /// 展示名
+    #[serde(default)]
+    pub display: String,
+    /// 厂商（按模型 id 前缀推断）
+    #[serde(default)]
+    pub vendor: String,
+    /// 积分倍率（0 = 未知）
+    #[serde(default)]
+    pub rate: f64,
+    /// 支持的 reasoning effort 档位（升序）
+    #[serde(default)]
+    pub efforts: Vec<String>,
+    /// 上下文长度（token，0 = 未知）
+    #[serde(default)]
+    pub context_length: u64,
+    /// 单次最大输出（0 = 未知）
+    #[serde(default)]
+    pub max_tokens: u64,
+    /// 是否支持图片输入
+    #[serde(default)]
+    pub supports_image: bool,
 }
 
 // ---------------------------------------------------------------------------

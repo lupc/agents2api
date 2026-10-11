@@ -14,7 +14,8 @@ use serde_json::{json, Value};
 use crate::auth::CredentialManager;
 use crate::models::get_available_models;
 
-use super::{passthrough_stream, ByteStream, Upstream, UpstreamRequest};
+use super::codebuddy_catalog;
+use super::{passthrough_stream, ByteStream, ModelInfo, Upstream, UpstreamRequest};
 
 pub struct CodeBuddyUpstream {
     backend: String,
@@ -27,6 +28,49 @@ impl CodeBuddyUpstream {
             backend: backend.unwrap_or_else(|| crate::auth::BACKEND.to_string()),
             cred,
         }
+    }
+
+    /// 拉取远程模型目录（`GET /console/enterprises/personal/models`）。
+    ///
+    /// 鉴权头来自凭据（与 chat 同族），另补目录接口需要的
+    /// origin/referer/X-Requested-With/X-Product（参考实现抓包口径）。
+    async fn fetch_catalog_raw(&self) -> Result<Value, String> {
+        let url = format!("{}/console/enterprises/personal/models", self.backend);
+        let mut headers = self.cred.get_headers().await?;
+        // 目录是 GET JSON：覆盖 Accept；补客户端识别头
+        for (k, v) in [
+            ("Accept", "application/json"),
+            ("origin", self.backend.as_str()),
+            ("referer", &self.backend),
+            ("X-Requested-With", "XMLHttpRequest"),
+            ("X-Product", "SaaS"),
+        ] {
+            headers.push((k.to_string(), v.to_string()));
+        }
+        let client = reqwest::Client::new();
+        let mut req = client.get(&url);
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+        let resp = req
+            .timeout(std::time::Duration::from_secs(20))
+            .send()
+            .await
+            .map_err(|e| format!("目录请求失败: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| format!("读取失败: {e}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "目录接口 HTTP {status}: body 摘要: {}",
+                text.chars().take(200).collect::<String>()
+            ));
+        }
+        serde_json::from_str(&text).map_err(|e| {
+            format!(
+                "目录响应解析失败: {e}；原始: {:?}",
+                text.chars().take(200).collect::<String>()
+            )
+        })
     }
 }
 
@@ -97,7 +141,18 @@ impl Upstream for CodeBuddyUpstream {
     }
 
     async fn models(&self) -> Vec<String> {
+        // 已同步远程目录时优先消费（与官方客户端口径一致），否则本地 product.json / 内置兜底
+        if let Some(catalog) = codebuddy_catalog::catalog_snapshot() {
+            return catalog.into_iter().map(|m| m.id).collect();
+        }
         get_available_models()
+    }
+
+    /// 远程模型目录：拉取 + 解析（含白名单/黑名单/质量门），失败返回 Err
+    /// 由调用方决定回退（本地目录不动）。
+    async fn sync_catalog(&self) -> Result<Vec<ModelInfo>, String> {
+        let body = self.fetch_catalog_raw().await?;
+        codebuddy_catalog::parse_upstream_catalog(&body)
     }
 
     async fn health_info(&self) -> Value {

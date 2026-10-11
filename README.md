@@ -70,7 +70,7 @@ pub trait Upstream: Send + Sync {
 |------|------|
 | 汇总统计 | 请求数/成功率/Tokens/P95 耗时卡片、请求趋势图、模型速率榜（P50/P95/TTFT）、按天用量表 |
 | 上游配置 | 各上游启用开关、codebuddy 后端地址与 trae chat host 覆盖、默认上游切换，保存即热重载 |
-| 模型同步 | 各上游模型目录一览，一键同步（Trae 从模型网关拉真实目录，失败回退内置列表） |
+| 模型同步 | 从上游目录接口拉取真实模型目录（Buddy: console/personal/models；Trae: batch_get_detail_param），含展示名/厂商/积分倍率/思考档位/上下文/图片支持，支持每日定时同步 |
 | 一键签到 | Trae 每日签到，逐次结果与按日趋势（CodeBuddy/WorkBuddy 暂不支持，接口已预留） |
 | 积分看板 | Trae 剩余/总额/已消耗积分、积分包明细与过期时间 |
 | 日志 | 查看滚动日志最新文件的尾部（`--log-dir` 启用时） |

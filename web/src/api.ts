@@ -86,6 +86,22 @@ export interface CreditsInfo {
   checkin_status_error?: string
 }
 
+export interface ModelInfo {
+  id: string
+  display: string
+  vendor: string
+  rate: number
+  efforts: string[]
+  context_length: number
+  max_tokens: number
+  supports_image: boolean
+}
+
+export interface AdminSettings {
+  daily_sync_enabled: boolean
+  daily_sync_time: string
+}
+
 export const api = {
   overview: (days = 7) => client.get<Overview>('/overview', { params: { days } }).then(r => r.data),
   usage: (days = 7) => client.get<{ window_days: number; days: UsageDay[] }>('/stats/usage', { params: { days } }).then(r => r.data),
@@ -93,8 +109,10 @@ export const api = {
   upstreams: () => client.get<{ upstreams: UpstreamRow[] }>('/upstreams').then(r => r.data),
   getConfig: () => client.get<AdminConfig>('/config').then(r => r.data),
   putConfig: (cfg: unknown) => client.put('/config', cfg).then(r => r.data),
-  models: () => client.get<{ by_upstream: { upstream: string; models: string[] }[]; snapshot?: { synced_at: string; by_upstream: { upstream: string; count: number; models: string[] }[] } }>('/models').then(r => r.data),
-  sync: () => client.post('/sync').then(r => r.data),
+  getSettings: () => client.get<AdminSettings>('/settings').then(r => r.data),
+  putSettings: (s: AdminSettings) => client.put('/settings', s).then(r => r.data),
+  models: () => client.get<{ by_upstream: { upstream: string; models: string[] }[]; snapshot?: { synced_at: string; by_upstream: Record<string, { count?: number; models?: ModelInfo[]; error?: string | null }> } }>('/models').then(r => r.data),
+  sync: () => client.post<{ ok: boolean; synced_at: string; by_upstream: Record<string, { count?: number; models?: ModelInfo[]; error?: string | null }> }>('/sync').then(r => r.data),
   checkin: () => client.post<{ ok: boolean; result: CheckinRecord }>('/checkin/trae').then(r => r.data),
   checkinResults: (days = 30) => client.get<{ records: CheckinRecord[]; trend: { date: string; ok: number; already: number; failed: number }[] }>('/checkin/results', { params: { days } }).then(r => r.data),
   credits: () => client.get<CreditsInfo>('/credits/trae').then(r => r.data),
