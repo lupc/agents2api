@@ -39,28 +39,81 @@ pub async fn health(State(st): State<AdminState>) -> Response {
 /// `GET /admin/api/overview?days=7`
 pub async fn overview(State(st): State<AdminState>, Query(q): Query<DaysQuery>) -> Response {
     let days = q.days.clamp(1, 365);
-    let mut body = st.app.metrics.overview(days);
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert(
-            "upstreams".to_string(),
-            json!(st.app.upstreams_snapshot().len()),
-        );
-        obj.insert(
-            "default_upstream".to_string(),
-            json!(st.app.default_upstream()),
-        );
+    match st.app.metrics.overview(days).await {
+        Ok(mut body) => {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "upstreams".to_string(),
+                    json!(st.app.upstreams_snapshot().len()),
+                );
+                obj.insert(
+                    "default_upstream".to_string(),
+                    json!(st.app.default_upstream()),
+                );
+            }
+            Json(body).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": {"message": e}})),
+        )
+            .into_response(),
     }
-    Json(body).into_response()
 }
 
 /// `GET /admin/api/stats/usage?days=7`
 pub async fn stats_usage(State(st): State<AdminState>, Query(q): Query<DaysQuery>) -> Response {
-    Json(st.app.metrics.usage(q.days.clamp(1, 365))).into_response()
+    match st.app.metrics.usage(q.days.clamp(1, 365)).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": {"message": e}})),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /admin/api/stats/models?days=7`
 pub async fn stats_models(State(st): State<AdminState>, Query(q): Query<DaysQuery>) -> Response {
-    Json(st.app.metrics.model_latency(q.days.clamp(1, 365))).into_response()
+    match st.app.metrics.model_latency(q.days.clamp(1, 365)).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": {"message": e}})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /admin/api/stats/speed?hours=24&recent=100`
+#[derive(Deserialize)]
+pub struct SpeedQuery {
+    /// 汇总窗口（小时）。
+    #[serde(default = "default_speed_hours")]
+    pub hours: usize,
+    /// 逐轮明细条数。
+    #[serde(default = "default_speed_recent")]
+    pub recent: usize,
+}
+
+fn default_speed_hours() -> usize {
+    24
+}
+
+fn default_speed_recent() -> usize {
+    100
+}
+
+/// `GET /admin/api/stats/speed` — 逐轮吞吐（预填充/解码速度）：小时/天序列 + 模型榜 + 逐轮明细。
+pub async fn stats_speed(State(st): State<AdminState>, Query(q): Query<SpeedQuery>) -> Response {
+    match st.app.speed.query(q.hours, q.recent).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": {"message": e}})),
+        )
+            .into_response(),
+    }
 }
 
 // ---- Phase 2 占位 ----
@@ -108,7 +161,10 @@ pub async fn reload_upstreams(State(st): State<AdminState>) -> Response {
     let count = registry.len();
     let default = registry.default_name();
     st.app.upstreams.replace(registry);
-    crate::config::log(&format!("🔄 上游注册表已重载：{count} 个上游，默认 {default}"));
+    crate::config::log_at(
+        crate::config::Level::Info,
+        &format!("🔄 上游注册表已重载：{count} 个上游，默认 {default}"),
+    );
     Json(json!({
         "ok": true,
         "upstream_count": count,
@@ -163,7 +219,10 @@ pub async fn put_config(State(st): State<AdminState>, Json(body): Json<Value>) -
     let count = registry.len();
     let default = registry.default_name();
     st.app.upstreams.replace(registry);
-    crate::config::log(&format!("🔄 配置已保存并重载：{count} 个上游，默认 {default}"));
+    crate::config::log_at(
+        crate::config::Level::Info,
+        &format!("🔄 配置已保存并重载：{count} 个上游，默认 {default}"),
+    );
     Json(json!({"ok": true, "upstream_count": count, "default_upstream": default}))
         .into_response()
 }
@@ -236,7 +295,10 @@ pub async fn sync_models_inner(st: &AdminState) -> Value {
                         &models,
                         &synced_at,
                     ) {
-                        crate::config::log(&format!("⚠️ {} 目录落盘失败: {e}", name));
+                        crate::config::log_at(
+                            crate::config::Level::Warn,
+                            &format!("{} 目录落盘失败: {e}", name),
+                        );
                     }
                 } else if name == "trae" {
                     crate::upstream::trae::catalog::set_catalog_snapshot(models.clone());
@@ -245,21 +307,30 @@ pub async fn sync_models_inner(st: &AdminState) -> Value {
                         &models,
                         &synced_at,
                     ) {
-                        crate::config::log(&format!("⚠️ {} 目录落盘失败: {e}", name));
+                        crate::config::log_at(
+                            crate::config::Level::Warn,
+                            &format!("{} 目录落盘失败: {e}", name),
+                        );
                     }
                 }
-                crate::config::log(&format!(
-                    "🔄 {} 模型目录同步成功：{} 个模型",
-                    name,
-                    models.len()
-                ));
+                crate::config::log_at(
+                    crate::config::Level::Info,
+                    &format!(
+                        "🔄 {} 模型目录同步成功：{} 个模型",
+                        name,
+                        models.len()
+                    ),
+                );
                 by_upstream.insert(
                     name,
                     json!({"count": models.len(), "models": models, "error": null}),
                 );
             }
             Err(e) => {
-                crate::config::log(&format!("⚠️ {} 模型目录同步失败: {e}", name));
+                crate::config::log_at(
+                    crate::config::Level::Warn,
+                    &format!("{} 模型目录同步失败: {e}", name),
+                );
                 by_upstream.insert(name, json!({"error": e}));
             }
         }
@@ -307,10 +378,28 @@ pub struct AdminSettings {
     /// 上次自动同步日期（防止一天内重复触发）。
     #[serde(default)]
     pub last_sync_date: String,
+    /// 自动签到开关。
+    #[serde(default)]
+    pub checkin_auto_enabled: bool,
+    /// 自动签到时间点列表（本地 HH:MM，可多选）。
+    #[serde(default)]
+    pub checkin_times: Vec<String>,
+    /// 已触发的自动签到标记（"{日期} {HH:MM}"，防止同一时间点重复触发）。
+    #[serde(default)]
+    pub last_checkin_fired: Vec<String>,
 }
 
 fn default_sync_time() -> String {
     "05:45".to_string()
+}
+
+/// 严格校验 HH:MM（两位小时、两位分钟）。
+fn valid_hhmm(t: &str) -> bool {
+    if t.len() != 5 || t.as_bytes()[2] != b':' {
+        return false;
+    }
+    let bytes = t.as_bytes();
+    bytes[..2].iter().all(u8::is_ascii_digit) && bytes[3..].iter().all(u8::is_ascii_digit)
 }
 
 impl Default for AdminSettings {
@@ -319,6 +408,9 @@ impl Default for AdminSettings {
             daily_sync_enabled: false,
             daily_sync_time: default_sync_time(),
             last_sync_date: String::new(),
+            checkin_auto_enabled: false,
+            checkin_times: Vec::new(),
+            last_checkin_fired: Vec::new(),
         }
     }
 }
@@ -355,11 +447,7 @@ pub async fn put_settings(State(st): State<AdminState>, Json(body): Json<Value>)
         s.daily_sync_enabled = b;
     }
     if let Some(t) = body.get("daily_sync_time").and_then(|v| v.as_str()) {
-        // 宽松校验 HH:MM
-        let ok = t.len() == 5
-            && t.as_bytes()[2] == b':'
-            && t.chars().enumerate().all(|(i, c)| i == 2 || c.is_ascii_digit());
-        if !ok {
+        if !valid_hhmm(t) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": {"message": "时间格式应为 HH:MM"}})),
@@ -367,6 +455,33 @@ pub async fn put_settings(State(st): State<AdminState>, Json(body): Json<Value>)
                 .into_response();
         }
         s.daily_sync_time = t.to_string();
+    }
+    if let Some(b) = body.get("checkin_auto_enabled").and_then(|v| v.as_bool()) {
+        s.checkin_auto_enabled = b;
+    }
+    if let Some(arr) = body.get("checkin_times").and_then(|v| v.as_array()) {
+        let mut times: Vec<String> = Vec::new();
+        for item in arr {
+            let Some(t) = item.as_str() else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": {"message": "时间点应为字符串"}})),
+                )
+                    .into_response();
+            };
+            if !valid_hhmm(t) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": {"message": format!("时间格式应为 HH:MM：{t}")}})),
+                )
+                    .into_response();
+            }
+            if !times.iter().any(|x| x == t) {
+                times.push(t.to_string());
+            }
+        }
+        times.sort();
+        s.checkin_times = times;
     }
     if let Err(e) = s.save(&st.data_dir) {
         return (
@@ -402,6 +517,43 @@ pub async fn checkin_buddy(State(st): State<AdminState>) -> Response {
         )
             .into_response(),
     }
+}
+
+/// 支持签到的上游（顺序固定，便于前端展示）。
+const CHECKIN_UPSTREAMS: &[&str] = &["trae", "buddy"];
+
+/// 逐个签到所有已启用的上游，汇总结果（不因单个失败而中断）。
+pub async fn run_checkin_all(st: &AdminState) -> Value {
+    let mut results: Vec<Value> = Vec::new();
+    for name in CHECKIN_UPSTREAMS {
+        let v = match *name {
+            "trae" => match super::checkin::run_checkin(st).await {
+                Ok(v) => v,
+                Err(e) => json!({"ok": false, "result": {"upstream": "trae", "status": "failed", "message": e}}),
+            },
+            "buddy" => match super::buddy_billing::run_checkin(st).await {
+                Ok(v) => v,
+                Err(e) => json!({"ok": false, "result": {"upstream": "buddy", "status": "failed", "message": e}}),
+            },
+            other => json!({"ok": false, "result": {"upstream": other, "status": "failed", "message": "不支持签到的上游"}}),
+        };
+        results.push(v);
+    }
+    let ok_count = results
+        .iter()
+        .filter(|v| v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false))
+        .count();
+    json!({
+        "ok": ok_count > 0,
+        "ok_count": ok_count,
+        "total": results.len(),
+        "results": results,
+    })
+}
+
+/// `POST /admin/api/checkin/all` — 一键签到所有上游。
+pub async fn checkin_all(State(st): State<AdminState>) -> Response {
+    Json(run_checkin_all(&st).await).into_response()
 }
 
 /// `GET /admin/api/checkin/results?days=30&upstream=trae`

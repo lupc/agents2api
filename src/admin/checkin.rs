@@ -7,7 +7,7 @@
 //! 与 llm_utils_chat 不同，这里鉴权用 `authorization: Cloud-IDE-JWT <jwt>`
 //! （带前缀），user-agent 伪装 VSCode 客户端。
 //!
-//! 结果逐账号落 `<data_dir>/checkin.json`，供趋势查询。
+//! 结果逐账号落 SQLite `checkin_records`（见 [`super::db`]），供趋势查询。
 
 use serde_json::{json, Value};
 
@@ -241,54 +241,58 @@ pub async fn trae_info(st: &super::AdminState) -> Result<TraeAuthInfo, String> {
     TraeCredential::new(path).info().await
 }
 
-/// 执行一键签到并落盘。
+/// 执行一键签到并落库。
 pub async fn run_checkin(st: &super::AdminState) -> Result<Value, String> {
     let info = trae_info(st).await?;
     let record = checkin_one(&info).await;
-
-    // 追加落盘（checkin.json：记录数组，保留 90 天）
-    let path = st.data_dir.join("checkin.json");
-    let mut records: Vec<CheckinRecord> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    records.push(record.clone());
-    let cutoff = (chrono::Local::now() - chrono::Duration::days(90))
-        .format("%Y-%m-%d")
-        .to_string();
-    records.retain(|r| r.date >= cutoff);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let tmp = path.with_extension("json.tmp");
-    let ok = serde_json::to_string_pretty(&records)
-        .ok()
-        .and_then(|t| std::fs::write(&tmp, t).ok())
-        .and_then(|_| std::fs::rename(&tmp, &path).ok())
-        .is_some();
-
+    save_record(st, &record);
     Ok(json!({
         "ok": record.status != "failed",
-        "saved": ok,
+        "saved": true,
         "result": record,
     }))
 }
 
+/// 把一条签到结果写入 DB 队列（非阻塞；落库由后台写入任务串行完成）。
+pub fn save_record(st: &super::AdminState, record: &CheckinRecord) {
+    st.recorder.checkin(super::db::CheckinEvent {
+        ts_ms: chrono::Local::now().timestamp_millis(),
+        date: record.date.clone(),
+        time: record.time.clone(),
+        uid: record.uid.clone(),
+        status: record.status.clone(),
+        message: record.message.clone(),
+        credits: record.credits,
+        delta: record.delta,
+        upstream: record.upstream.clone(),
+    });
+}
+
 /// 签到记录与按日趋势（按上游过滤；旧记录无 upstream 字段视为 trae）。
 pub fn results(st: &super::AdminState, days: usize, upstream: &str) -> Value {
-    let path = st.data_dir.join("checkin.json");
-    let records: Vec<CheckinRecord> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
+    // 该函数是同步的（被 axum handler 直接调用），因此用阻塞方式取数：
+    // 在专用 runtime 上 block_on，避免把 handler 改成 async 的连锁改动。
     let cutoff = (chrono::Local::now() - chrono::Duration::days(days as i64 - 1))
         .format("%Y-%m-%d")
         .to_string();
-    let recent: Vec<CheckinRecord> = records
+    let up = upstream.to_string();
+    let rows = block_on(st.db.checkin_rows(&cutoff))
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
+    let recent: Vec<CheckinRecord> = rows
         .into_iter()
-        .filter(|r| r.date >= cutoff)
-        .filter(|r| r.upstream.as_str() == upstream
-            || (upstream == "trae" && r.upstream.is_empty()))
+        .filter(|r| r.upstream == up || (up == "trae" && r.upstream.is_empty()))
+        .map(|r| CheckinRecord {
+            date: r.date,
+            time: r.time,
+            uid: r.uid,
+            status: r.status,
+            message: r.message,
+            credits: r.credits,
+            delta: r.delta,
+            upstream: r.upstream,
+        })
         .collect();
     // 按日聚合趋势
     let mut trend: std::collections::BTreeMap<String, (u64, u64, u64)> =
@@ -311,6 +315,20 @@ pub fn results(st: &super::AdminState, days: usize, upstream: &str) -> Value {
         "records": recent.iter().rev().take(100).collect::<Vec<_>>(),
         "trend": trend,
     })
+}
+
+/// 在当前线程的公共 runtime 上阻塞执行一个 future（供同步 handler 调用 async DB）。
+///
+/// axum handler 运行于 tokio runtime 上下文，此处复用该 runtime 的 handle；
+/// 若不在 runtime 上下文（单测），则临时建一个。
+fn block_on<F: std::future::Future>(fut: F) -> Result<F::Output, String> {
+    use tokio::runtime::{Handle, Runtime};
+    if let Ok(h) = Handle::try_current() {
+        // 已在运行时内：用 block_in_place 防止阻塞 worker
+        return Ok(tokio::task::block_in_place(|| h.block_on(fut)));
+    }
+    let rt = Runtime::new().map_err(|e| format!("创建 runtime 失败: {e}"))?;
+    Ok(rt.block_on(fut))
 }
 
 #[cfg(test)]

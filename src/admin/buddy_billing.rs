@@ -229,7 +229,7 @@ async fn checkin_once(headers: &[(String, String)]) -> CheckinRecord {
     record
 }
 
-/// Buddy 一键签到入口（落盘复用 checkin.json，记录带 upstream=buddy）。
+/// Buddy 一键签到入口（落库复用同一张 checkin_records 表，记录带 upstream=buddy）。
 pub async fn run_checkin(st: &super::AdminState) -> Result<Value, String> {
     if st.app.upstream(Some("buddy")).is_none() {
         return Err("Buddy 上游未启用或未找到登录态（CodeBuddyExtension auth）".to_string());
@@ -237,31 +237,11 @@ pub async fn run_checkin(st: &super::AdminState) -> Result<Value, String> {
     let headers = billing_headers().await?;
     let mut record = checkin_once(&headers).await;
     record.upstream = "buddy".to_string();
-
-    // 追加落盘（与 trae 共用 checkin.json；按 upstream 字段区分）
-    let path = st.data_dir.join("checkin.json");
-    let mut records: Vec<CheckinRecord> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    records.push(record.clone());
-    let cutoff = (chrono::Local::now() - chrono::Duration::days(90))
-        .format("%Y-%m-%d")
-        .to_string();
-    records.retain(|r| r.date >= cutoff);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let tmp = path.with_extension("json.tmp");
-    let ok = serde_json::to_string_pretty(&records)
-        .ok()
-        .and_then(|t| std::fs::write(&tmp, t).ok())
-        .and_then(|_| std::fs::rename(&tmp, &path).ok())
-        .is_some();
+    super::checkin::save_record(st, &record);
 
     Ok(json!({
         "ok": record.status != "failed",
-        "saved": ok,
+        "saved": true,
         "result": record,
     }))
 }
@@ -345,6 +325,71 @@ pub(crate) fn fmt_ts(ts: i64) -> String {
 /// unix 秒 → 本地日期串（供 trae 积分包复用）。
 pub(crate) fn fmt_ts_local(ts: i64) -> Option<String> {
     Some(fmt_ts(ts))
+}
+
+/// 今日消耗积分：官方逐请求用量接口 `{base}/billing/meter/get-user-request-usage`
+/// （注意：该路径无 `/v2/` 前缀）。按本地自然日聚合 `data.data[].credit`。
+/// 参考 TraeWorkAssistant `wb_credits.rs` 的 `usage_official_fetch`。
+async fn fetch_usage_today(
+    base: &str,
+    headers: &[(String, String)],
+) -> Result<f64, String> {
+    let today = chrono::Local::now().date_naive();
+    let start_text = format!("{today} 00:00:00");
+    let end_text = format!("{today} 23:59:59");
+
+    const PAGE_SIZE: i64 = 3000;
+    let mut total_credits = 0.0_f64;
+    let mut seen = 0_i64;
+    let mut total: i64 = 0;
+
+    for page in 1..=20_i64 {
+        let body = json!({
+            "startTime": start_text,
+            "endTime": end_text,
+            "pageNum": page,
+            "pageSize": PAGE_SIZE,
+        });
+        let (status, parsed, raw) = post_json(
+            &format!("{base}/billing/meter/get-user-request-usage"),
+            headers,
+            &body,
+        )
+        .await?;
+        if status != 200 {
+            return Err(format!(
+                "今日消耗 HTTP {status}: {}",
+                raw.chars().take(200).collect::<String>()
+            ));
+        }
+        let Some(v) = parsed else {
+            return Err("今日消耗响应非 JSON".to_string());
+        };
+        if let Some(code) = v.get("code").and_then(Value::as_i64) {
+            if code != 0 && code != 200 {
+                return Err(format!("今日消耗 code={code}"));
+            }
+        }
+        if total == 0 {
+            total = v.pointer("/data/total").and_then(Value::as_i64).unwrap_or(0);
+        }
+        match v.pointer("/data/data").and_then(|d| d.as_array()) {
+            Some(arr) if !arr.is_empty() => {
+                seen += arr.len() as i64;
+                for r in arr {
+                    let credit = num_or_none(r.get("credit")).unwrap_or(0.0);
+                    if credit >= 0.0 {
+                        total_credits += credit;
+                    }
+                }
+                if seen >= total || (arr.len() as i64) < PAGE_SIZE {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    Ok(total_credits)
 }
 
 /// 容量条目 → 积分包明细（对齐参考实现 packages_from 字段链）。
@@ -525,10 +570,17 @@ pub async fn fetch_credits(st: &super::AdminState) -> Result<Value, String> {
     if st.app.upstream(Some("buddy")).is_none() {
         return Err("Buddy 上游未启用或未找到登录态（CodeBuddyExtension auth）".to_string());
     }
-    let headers = billing_headers().await?;
+    let path = crate::auth::find_auth_file()
+        .ok_or("未找到 Buddy 登录态文件（CodeBuddyExtension auth）")?;
+    let cred = CredentialManager::new(path);
+    let headers = cred.get_headers().await?;
+
+    // 账号信息（uid / nickname / token 过期状态）
+    let acct = cred.summary().await.unwrap_or(json!({}));
 
     let mut pkgs: Vec<Value> = vec![];
     let mut balance: Option<f64> = None;
+    let mut used_base = BILLING_BASE_CN;
     // 主域名 → 备用域名（仅主域名整体网络不可达时）
     for base in [BILLING_BASE_CN, BILLING_BASE_ALT] {
         let (p, b, saw_auth, net_down) = fetch_round(base, &headers).await;
@@ -540,7 +592,33 @@ pub async fn fetch_credits(st: &super::AdminState) -> Result<Value, String> {
         if saw_auth && pkgs.is_empty() && balance.is_none() {
             return Err(format!("登录态失效（{base} 返回 401），请重新登录桌面端"));
         }
+        used_base = base;
         break;
+    }
+
+    // 今日消耗：官方逐请求用量接口（精简请求头：仅 Authorization/Content-Type + 平台标识）
+    let usage_headers: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(k, _)| {
+            let k = k.to_ascii_lowercase();
+            k == "authorization" || k == "content-type"
+        })
+        .cloned()
+        .chain(std::iter::once((
+            "X-Client-Platform".to_string(),
+            "web".to_string(),
+        )))
+        .collect();
+    let today_usage = fetch_usage_today(used_base, &usage_headers).await;
+
+    let mut out = json!({
+        "upstream": "buddy",
+        "uid": acct.get("uid").cloned().unwrap_or(Value::Null),
+        "token_expired": acct.get("token_expired").cloned().unwrap_or(json!(false)),
+    });
+    match &today_usage {
+        Ok(v) => out["today_consumed"] = json!(v),
+        Err(e) => out["today_consumed_error"] = json!(e),
     }
 
     if pkgs.is_empty() && balance.is_none() {
@@ -560,12 +638,10 @@ pub async fn fetch_credits(st: &super::AdminState) -> Result<Value, String> {
                 .iter()
                 .filter_map(|p| p.get("remaining").and_then(Value::as_f64))
                 .sum();
-            return Ok(json!({
-                "upstream": "buddy",
-                "source": "legacy",
-                "remaining_credits": bal,
-                "packs": old_pkgs,
-            }));
+            out["source"] = json!("legacy");
+            out["remaining_credits"] = json!(bal);
+            out["packs"] = json!(old_pkgs);
+            return Ok(out);
         }
         return Err("积分接口全部失败（旧接口也无有效数据）".to_string());
     }
@@ -577,12 +653,10 @@ pub async fn fetch_credits(st: &super::AdminState) -> Result<Value, String> {
             .unwrap_or(0.0)
             .total_cmp(&a["remaining"].as_f64().unwrap_or(0.0))
     });
-    Ok(json!({
-        "upstream": "buddy",
-        "source": "cloud",
-        "remaining_credits": balance,
-        "packs": pkgs,
-    }))
+    out["source"] = json!("cloud");
+    out["remaining_credits"] = json!(balance);
+    out["packs"] = json!(pkgs);
+    Ok(out)
 }
 
 #[cfg(test)]

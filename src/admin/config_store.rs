@@ -31,6 +31,8 @@ pub struct BaseSettings {
     pub trae_chat_host: Option<String>,
     pub trae_storage_json: Option<String>,
     pub opencode_auth_json: Option<String>,
+    /// OpenCode Zen 匿名免费通道 base URL 覆盖。
+    pub opencode_zen_base_url: Option<String>,
 }
 
 /// 单上游的文件覆盖项。
@@ -52,6 +54,9 @@ pub struct UpstreamOverride {
 fn default_true() -> bool {
     true
 }
+
+/// OpenCode Zen 匿名免费通道在注册表里的上游名。
+pub const ZEN_FREE_UPSTREAM: &str = "opencode-free";
 
 /// 整个配置文件。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +200,21 @@ pub fn build_registry(
         }
     }
 
+    // OpenCode Zen 匿名免费通道（无需登录态；身份校验基于客户端标识头 + 哨兵密钥）
+    if !disabled(ZEN_FREE_UPSTREAM) {
+        let base_url = overrides
+            .ov(ZEN_FREE_UPSTREAM)
+            .and_then(|o| o.backend.clone())
+            .or_else(|| base.opencode_zen_base_url.clone());
+        map.insert(
+            ZEN_FREE_UPSTREAM.to_string(),
+            Arc::new(crate::upstream::opencode::zen_free::OpenCodeZenFreeUpstream::new(
+                ZEN_FREE_UPSTREAM.to_string(),
+                base_url,
+            )),
+        );
+    }
+
     let default = overrides
         .default_upstream
         .clone()
@@ -212,6 +232,10 @@ pub fn config_view(cfg: &UpstreamsConfig, base: &BaseSettings) -> Value {
         .ov("trae")
         .and_then(|o| o.chat_host.clone())
         .or_else(|| base.trae_chat_host.clone());
+    let zen_base_url = cfg
+        .ov(ZEN_FREE_UPSTREAM)
+        .and_then(|o| o.backend.clone())
+        .or_else(|| base.opencode_zen_base_url.clone());
     serde_json::json!({
         "default_upstream": cfg.default_upstream.clone().unwrap_or_else(|| "buddy".to_string()),
         "upstreams": {
@@ -224,6 +248,10 @@ pub fn config_view(cfg: &UpstreamsConfig, base: &BaseSettings) -> Value {
                 "chat_host": trae_chat_host,
             },
             "opencode": { "enabled": cfg.enabled("opencode", false) },
+            ZEN_FREE_UPSTREAM: {
+                "enabled": cfg.enabled(ZEN_FREE_UPSTREAM, false),
+                "backend": zen_base_url,
+            },
         },
     })
 }
