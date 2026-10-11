@@ -187,6 +187,7 @@ async fn main() {
         metrics: metrics.clone(),
         data_dir: data_dir.clone(),
         admin_enabled: !cli.no_admin,
+        log_dir: cli.log_dir.clone().map(std::path::PathBuf::from),
     });
 
     // 统计周期落盘（2s 节流在 MetricsStore 内部）

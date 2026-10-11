@@ -183,6 +183,8 @@ pub struct AppState {
     pub data_dir: PathBuf,
     /// 是否启用管理后台（/admin/*）。
     pub admin_enabled: bool,
+    /// 滚动日志目录（--log-dir；后台日志查看读取此处）。
+    pub log_dir: Option<PathBuf>,
 }
 
 impl AppState {

@@ -78,7 +78,8 @@ pub async fn index() -> Response {
     serve("index.html")
 }
 
-/// 未知 `/admin/*` 路径：静态资源存在则返回，否则回 `index.html`（SPA 路由）。
+/// 未知 `/admin/*` 路径：带扩展名的找静态资源（找不到 404），
+/// 其余（SPA 前端路由如 /dashboard）一律回 `index.html`。
 ///
 /// 注意：axum 的 fallback 没有路由参数，`Path` 提取器会报错，必须用 `OriginalUri`。
 pub async fn spa_fallback(uri: axum::extract::OriginalUri) -> Response {
@@ -88,7 +89,6 @@ pub async fn spa_fallback(uri: axum::extract::OriginalUri) -> Response {
         .trim_start_matches("/admin/")
         .trim_start_matches('/')
         .to_string();
-    // 明确带扩展名的路径不走 SPA 回退，避免把缺失的 js/css 变成 html
     if std::path::Path::new(&path)
         .extension()
         .map(|e| e != "html")
@@ -103,5 +103,5 @@ pub async fn spa_fallback(uri: axum::extract::OriginalUri) -> Response {
             None => (StatusCode::NOT_FOUND, "not found").into_response(),
         };
     }
-    serve(&path)
+    serve("index.html")
 }

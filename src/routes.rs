@@ -1410,6 +1410,7 @@ mod tests {
                 &std::env::temp_dir().join("agents2api-test-metrics"),
             )),
             data_dir: std::env::temp_dir().join("agents2api-test"),
+            log_dir: None,
             admin_enabled: false,
         })
     }
@@ -1524,6 +1525,7 @@ mod tests {
                 &std::env::temp_dir().join("agents2api-test-metrics"),
             )),
             data_dir: std::env::temp_dir().join("agents2api-test"),
+            log_dir: None,
             admin_enabled: false,
         };
         let mut headers = HeaderMap::new();

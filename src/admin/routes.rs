@@ -268,22 +268,42 @@ fn default_lines() -> usize {
 
 pub async fn logs_tail(State(st): State<AdminState>, Query(q): Query<LogsQuery>) -> Response {
     let lines = q.lines.clamp(1, 5000);
-    // 读取 data_dir 下最新的日志文件尾部。日志可能配置在别处，
-    // 这里只扫 data_dir/logs 与日志目录；找不到就返回空。
-    let log_dir = st.data_dir.join("logs");
+    // 优先读 --log-dir 指定的滚动日志目录（递归找最新文件），退回 data_dir/logs
     let mut newest: Option<std::path::PathBuf> = None;
     let mut newest_mtime = std::time::SystemTime::UNIX_EPOCH;
-    if let Ok(rd) = std::fs::read_dir(&log_dir) {
+    fn search(dir: &std::path::Path, newest: &mut Option<std::path::PathBuf>, newest_mtime: &mut std::time::SystemTime) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
         for e in rd.flatten() {
-            if let Ok(md) = e.metadata() {
+            let p = e.path();
+            if p.is_dir() {
+                // 日期子目录，深入一层
+                if let Ok(sub) = std::fs::read_dir(&p) {
+                    for se in sub.flatten() {
+                        if let Ok(md) = se.metadata() {
+                            if let Ok(mt) = md.modified() {
+                                if mt > *newest_mtime {
+                                    *newest_mtime = mt;
+                                    *newest = Some(se.path());
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Ok(md) = e.metadata() {
                 if let Ok(mt) = md.modified() {
-                    if mt > newest_mtime {
-                        newest_mtime = mt;
-                        newest = Some(e.path());
+                    if mt > *newest_mtime {
+                        *newest_mtime = mt;
+                        *newest = Some(p);
                     }
                 }
             }
         }
+    };
+    if let Some(ld) = &st.app.log_dir {
+        search(ld, &mut newest, &mut newest_mtime);
+    }
+    if newest.is_none() {
+        search(&st.data_dir.join("logs"), &mut newest, &mut newest_mtime);
     }
     let text = newest
         .as_ref()

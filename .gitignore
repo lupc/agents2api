@@ -2,5 +2,6 @@ target/
 *.log
 converter.log
 .zcode/
-dist/
+/dist/
 *.exe
+web/node_modules/
