@@ -34,7 +34,7 @@ fn split_sentences(s: &str) -> Vec<&str> {
         if matches!(ch, '.' | '!' | '?' | '。' | '！' | '？') {
             let next_is_ws_or_end = char_indices
                 .get(i + 1)
-                .map_or(true, |&(_, c)| c.is_whitespace());
+                .is_none_or(|&(_, c)| c.is_whitespace());
             if next_is_ws_or_end {
                 let end = byte_idx + ch.len_utf8();
                 parts.push(&s[start..end]);

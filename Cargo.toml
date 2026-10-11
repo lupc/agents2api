@@ -24,6 +24,8 @@ rand = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 chrono = "0.4"
 bytes = "1"
+rust-embed = "8"
+mime_guess = "2"
 
 [profile.release]
 opt-level = 2

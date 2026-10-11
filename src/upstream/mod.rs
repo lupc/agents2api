@@ -9,6 +9,7 @@
 //!   避免每个 handler 各写一套聚合逻辑。
 
 pub mod codebuddy;
+pub mod opencode;
 pub mod sse;
 pub mod trae;
 

@@ -126,7 +126,7 @@ pub fn decrypt_blob(blob: &[u8]) -> Result<Value, String> {
     }
     let random = &blob[HEADER_SIZE..HEADER_SIZE + RANDOM_BYTES_LEN];
     let ciphertext = &blob[HEADER_SIZE + RANDOM_BYTES_LEN..];
-    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
         return Err(format!("密文长度非法：{}", ciphertext.len()));
     }
 

@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use crate::anthropic::{anthropic_request_to_chat, AnthropicStreamConverter};
 use crate::auth::parse_headers;
-use crate::config::{log_rid, new_rid, AppState, SharedState};
+use crate::config::{err_chain, log_rid, new_rid, AppState, SharedState};
 use crate::desensitize::desensitize_body;
 use crate::identity::filter_system_identity;
 use crate::projection::project_responses_chat_body;
@@ -62,7 +62,12 @@ const PASSTHROUGH_BODY_KEYS: &[&str] = &[
 const MAX_UPSTREAM_BODY: usize = 64 * 1024 * 1024;
 
 pub fn router(state: SharedState) -> Router {
-    Router::new()
+    let admin_enabled = state.admin_enabled;
+    let admin_state = crate::admin::AdminState {
+        app: state.clone(),
+        data_dir: state.data_dir.clone(),
+    };
+    let mut app = Router::new()
         // 无前缀 → 默认上游
         .route("/health", get(health_default))
         .route("/v1/models", get(models_default))
@@ -82,8 +87,18 @@ pub fn router(state: SharedState) -> Router {
         .route(
             "/{upstream}/v1/messages/count_tokens",
             post(count_tokens_named),
-        )
-        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
+        );
+    if admin_enabled {
+        // axum 0.8 的 nest 不再特殊处理尾斜杠：/admin/ 需显式重定向到 /admin
+        app = app.route(
+            "/admin/",
+            get(|| async {
+                axum::response::Redirect::temporary("/admin")
+            }),
+        );
+        app = app.nest("/admin", crate::admin::router(admin_state));
+    }
+    app.layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -282,22 +297,101 @@ enum Executed {
     Stream(ByteStream),
 }
 
+/// 从 chat body 取模型名（用于统计）。
+fn metrics_model(chat_body: &Value) -> String {
+    chat_body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// 给上游字节流套一层统计：转发不变，流结束时记一次请求统计。
+///
+/// 单一记录点覆盖全部端点与流式/非流式两种模式——因为 `execute_aggregate`
+/// 也是消费这条流来聚合的。
+fn instrument_stream(
+    stream: ByteStream,
+    metrics: Arc<crate::admin::MetricsStore>,
+    upstream: String,
+    model: String,
+    is_stream: bool,
+    ttfb_ms: u64,
+) -> ByteStream {
+    Box::pin(async_stream::stream! {
+        let mut stream = stream;
+        let started = Instant::now();
+        let mut ok = true;
+        let mut stats = StreamStats::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(b) => {
+                    stats.feed(&b);
+                    yield Ok(b);
+                }
+                Err(e) => {
+                    ok = false;
+                    yield Err(e);
+                    break;
+                }
+            }
+        }
+        metrics.record(crate::admin::metrics::Record {
+            upstream,
+            model,
+            stream: is_stream,
+            ok,
+            prompt_tokens: stats.prompt_tokens,
+            completion_tokens: stats.completion_tokens,
+            duration_ms: ttfb_ms + started.elapsed().as_millis() as u64,
+            ttfb_ms,
+        });
+        metrics.flush_if_due();
+    })
+}
+
+/// 记录一次失败请求（上游准备失败 / 网络错误 / 非 200）。
+fn record_failure(
+    state: &AppState,
+    upstream: &str,
+    model: &str,
+    is_stream: bool,
+    ttfb_ms: u64,
+) {
+    state.metrics.record(crate::admin::metrics::Record {
+        upstream: upstream.to_string(),
+        model: model.to_string(),
+        stream: is_stream,
+        ok: false,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        duration_ms: ttfb_ms,
+        ttfb_ms,
+    });
+    state.metrics.flush_if_due();
+}
+
 /// 统一执行：准备请求 → 发起 → 返回已转换的 OpenAI SSE 流。
 ///
-/// 转换由 `upstream.translate_stream` 负责（CodeBuddy 是恒等转发，Trae 是私有事件转换）。
+/// 转换由 `upstream.translate_stream` 负责（CodeBuddy 是恒等转发，Trae 是私有转换）。
 async fn execute_upstream(
     state: &AppState,
     upstream: &Arc<dyn Upstream>,
     chat_body: &Value,
     rid: &str,
     label: &str,
+    is_stream: bool,
 ) -> Result<Executed, Response> {
+    let model = metrics_model(chat_body);
+    let up_name = upstream.name().to_string();
+    let t0 = Instant::now();
+
     let prepared = upstream.prepare_chat(chat_body).await.map_err(|e| {
         log_rid(rid, &format!("✗ 上游准备失败 | {label} | {e}"));
+        record_failure(state, &up_name, &model, is_stream, t0.elapsed().as_millis() as u64);
         err_openai(StatusCode::BAD_GATEWAY, e, "auth_error")
     })?;
 
-    let t0 = Instant::now();
     let resp = state
         .http
         .post(&prepared.url)
@@ -306,14 +400,13 @@ async fn execute_upstream(
         .send()
         .await
         .map_err(|e| {
-            log_rid(rid, &format!("✗ 网络错误 | {label} | {e}"));
-            err_openai(
-                StatusCode::BAD_GATEWAY,
-                format!("upstream error: {e}"),
-                "upstream_error",
-            )
+            let msg = format!("upstream error: {}", err_chain(&e));
+            log_rid(rid, &format!("✗ 网络错误 | {label} | {msg}"));
+            record_failure(state, &up_name, &model, is_stream, t0.elapsed().as_millis() as u64);
+            err_openai(StatusCode::BAD_GATEWAY, msg, "upstream_error")
         })?;
 
+    let ttfb_ms = t0.elapsed().as_millis() as u64;
     let status = resp.status().as_u16();
     if status != 200 {
         let raw = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
@@ -328,6 +421,7 @@ async fn execute_upstream(
             rid,
             &format!("── ERROR BODY ──\n{}", String::from_utf8_lossy(&raw)),
         );
+        record_failure(state, &up_name, &model, is_stream, ttfb_ms);
         return Err(err_detail(
             StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
             safe_err_raw(&raw, status),
@@ -345,9 +439,15 @@ async fn execute_upstream(
             serde_json::to_string_pretty(&prepared.body).unwrap_or_default()
         ),
     );
-    Ok(Executed::Stream(upstream.translate_stream(Box::pin(
-        resp.bytes_stream(),
-    ))))
+    let translated = upstream.translate_stream(Box::pin(resp.bytes_stream()));
+    Ok(Executed::Stream(instrument_stream(
+        translated,
+        state.metrics.clone(),
+        up_name,
+        model,
+        is_stream,
+        ttfb_ms,
+    )))
 }
 
 /// 流式：把上游流包成 HTTP SSE 响应，并统计 finish_reason / tool_calls / usage。
@@ -365,8 +465,9 @@ fn into_sse(executed: Executed, rid: String, label: String) -> Response {
                     yield Ok(b);
                 }
                 Err(e) => {
-                    log_rid(&rid, &format!("✗ 流中断 | {label} | {e}"));
-                    yield Ok(Bytes::from(err_event(&e.to_string(), 502)));
+                    let msg = err_chain(&e);
+                    log_rid(&rid, &format!("✗ 流中断 | {label} | {msg}"));
+                    yield Ok(Bytes::from(err_event(&msg, 502)));
                     break;
                 }
             }
@@ -401,8 +502,9 @@ async fn execute_aggregate(
     chat_body: &Value,
     rid: &str,
     label: &str,
+    is_stream: bool,
 ) -> Result<Value, Response> {
-    let executed = execute_upstream(state, upstream, chat_body, rid, label).await?;
+    let executed = execute_upstream(state, upstream, chat_body, rid, label, is_stream).await?;
     let Executed::Stream(mut stream) = executed;
     let mut raw: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -418,12 +520,9 @@ async fn execute_aggregate(
                 raw.extend_from_slice(&b);
             }
             Err(e) => {
-                log_rid(rid, &format!("✗ 流中断 | {label} | {e}"));
-                return Err(err_openai(
-                    StatusCode::BAD_GATEWAY,
-                    format!("upstream error: {e}"),
-                    "upstream_error",
-                ));
+                let msg = format!("upstream error: {}", err_chain(&e));
+                log_rid(rid, &format!("✗ 流中断 | {label} | {msg}"));
+                return Err(err_openai(StatusCode::BAD_GATEWAY, msg, "upstream_error"));
             }
         }
     }
@@ -437,19 +536,18 @@ async fn execute_aggregate_with_retry(
     chat_body: &Value,
     rid: &str,
     label: &str,
+    is_stream: bool,
 ) -> Result<Value, Response> {
-    let executed = execute_upstream(state, upstream, chat_body, rid, label).await?;
+    let executed = execute_upstream(state, upstream, chat_body, rid, label, is_stream).await?;
     let Executed::Stream(mut stream) = executed;
     let mut raw: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(b) => raw.extend_from_slice(&b),
             Err(e) => {
-                return Err(err_openai(
-                    StatusCode::BAD_GATEWAY,
-                    format!("upstream error: {e}"),
-                    "upstream_error",
-                ))
+                let msg = format!("upstream error: {}", err_chain(&e));
+                log_rid(rid, &format!("✗ 流中断 | {label} | {msg}"));
+                return Err(err_openai(StatusCode::BAD_GATEWAY, msg, "upstream_error"));
             }
         }
     }
@@ -465,7 +563,7 @@ async fn execute_aggregate_with_retry(
             &format!("↻ RESPONSES {label} | content filter detected, retry with compact harness"),
         );
         if let Ok(Executed::Stream(mut s)) =
-            execute_upstream(state, upstream, &retry_body, rid, label).await
+            execute_upstream(state, upstream, &retry_body, rid, label, is_stream).await
         {
             let mut retry_raw: Vec<u8> = Vec::new();
             while let Some(chunk) = s.next().await {
@@ -642,12 +740,12 @@ async fn chat_completions_impl(
     );
 
     if client_wants_stream {
-        match execute_upstream(state, &upstream, &backend_body, &rid, &label).await {
+        match execute_upstream(state, &upstream, &backend_body, &rid, &label, client_wants_stream).await {
             Ok(executed) => into_sse(executed, rid, label),
             Err(resp) => resp,
         }
     } else {
-        match execute_aggregate(state, &upstream, &backend_body, &rid, &label).await {
+        match execute_aggregate(state, &upstream, &backend_body, &rid, &label, client_wants_stream).await {
             Ok(v) => {
                 log_finish(&label, &v, &rid);
                 Json(v).into_response()
@@ -805,7 +903,7 @@ async fn create_response_impl(
     );
 
     if client_wants_stream {
-        match execute_upstream(state, &upstream, &chat_body, &rid, &label).await {
+        match execute_upstream(state, &upstream, &chat_body, &rid, &label, client_wants_stream).await {
             Ok(Executed::Stream(mut stream)) => {
                 let rid2 = rid.clone();
                 let label2 = label.clone();
@@ -841,7 +939,7 @@ async fn create_response_impl(
             Err(resp) => resp,
         }
     } else {
-        match execute_aggregate_with_retry(state, &upstream, &chat_body, &rid, &label).await {
+        match execute_aggregate_with_retry(state, &upstream, &chat_body, &rid, &label, client_wants_stream).await {
             Ok(chat_result) => {
                 let result = responses_from_chat(&chat_result, &model_name);
                 let mut response_status = 200;
@@ -1023,7 +1121,7 @@ async fn create_message_impl(
     );
 
     if user_stream {
-        match execute_upstream(state, &upstream, &chat_body, &rid, &label).await {
+        match execute_upstream(state, &upstream, &chat_body, &rid, &label, user_stream).await {
             Ok(Executed::Stream(mut stream)) => {
                 let rid2 = rid.clone();
                 let label2 = label.clone();
@@ -1060,7 +1158,7 @@ async fn create_message_impl(
             Err(resp) => resp,
         }
     } else {
-        match execute_aggregate(state, &upstream, &chat_body, &rid, &label).await {
+        match execute_aggregate(state, &upstream, &chat_body, &rid, &label, user_stream).await {
             Ok(chat_result) => {
                 let result = anthropic_from_chat(&chat_result, &model_name);
                 log_rid(&rid, &format!("◀ ANTHROPIC {label} | nonstream done"));
@@ -1187,7 +1285,7 @@ async fn count_tokens_impl(
 
     let rid = new_rid();
     let label = format!("{} count_tokens", upstream.name());
-    match execute_aggregate(state, &upstream, &chat_body, &rid, &label).await {
+    match execute_aggregate(state, &upstream, &chat_body, &rid, &label, false).await {
         Ok(result) => {
             let input_tokens = result
                 .pointer("/usage/prompt_tokens")
@@ -1303,6 +1401,11 @@ mod tests {
             upstreams,
             default_upstream: "trae".to_string(),
             http: reqwest::Client::new(),
+            metrics: std::sync::Arc::new(crate::admin::MetricsStore::load(
+                &std::env::temp_dir().join("agents2api-test-metrics"),
+            )),
+            data_dir: std::env::temp_dir().join("agents2api-test"),
+            admin_enabled: false,
         })
     }
 
@@ -1411,6 +1514,11 @@ mod tests {
             upstreams,
             default_upstream: "trae".to_string(),
             http: reqwest::Client::new(),
+            metrics: std::sync::Arc::new(crate::admin::MetricsStore::load(
+                &std::env::temp_dir().join("agents2api-test-metrics"),
+            )),
+            data_dir: std::env::temp_dir().join("agents2api-test"),
+            admin_enabled: false,
         };
         let mut headers = HeaderMap::new();
         assert!(check_auth(&state, &headers).is_err());

@@ -339,16 +339,15 @@ fn prune_runtime_fragments(role: &str, text: &str) -> String {
         };
     }
 
-    if role == "user" && looks_like_harness_user_message(Some(&Value::String(pruned.clone()))) {
-        if pruned.contains("# AGENTS.md instructions")
+    if role == "user" && looks_like_harness_user_message(Some(&Value::String(pruned.clone())))
+        && (pruned.contains("# AGENTS.md instructions")
             || text.contains("<environment_context>")
-            || text.contains("<skills_instructions>")
+            || text.contains("<skills_instructions>"))
         {
             return "Repository instructions and durable user context are provided. \
                     Follow repository guidance while answering the user's actual request."
                 .to_string();
         }
-    }
 
     let re3 = Regex::new(r"\n{3,}").unwrap();
     re3.replace_all(&pruned, "\n\n").trim().to_string()

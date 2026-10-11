@@ -8,6 +8,7 @@
 //!     由 `upstream::trae` 做双向转换。
 //!   - 多上游并存，按路径前缀隔离：`/trae/v1/...`、`/codebuddy/v1/...`。
 
+mod admin;
 mod anthropic;
 mod auth;
 mod config;
@@ -81,6 +82,15 @@ struct Cli {
     /// 显式指定 Trae storage.json 路径
     #[arg(long, env = "TRAE_STORAGE_JSON")]
     trae_storage_json: Option<String>,
+    /// 显式指定 OpenCode auth.json 路径
+    #[arg(long, env = "OPENCODE_AUTH_JSON")]
+    opencode_auth_json: Option<String>,
+    /// 数据目录（统计、签到记录、后台配置）；默认 %APPDATA%\agents2api
+    #[arg(long, env = "AGENTS2API_DATA_DIR")]
+    data_dir: Option<String>,
+    /// 关闭管理后台（/admin/*）
+    #[arg(long, default_value_t = false)]
+    no_admin: bool,
 }
 
 /// 构建上游注册表。
@@ -121,40 +131,64 @@ fn build_upstreams(cli: &Cli) -> HashMap<String, Arc<dyn Upstream>> {
         }
     }
 
+    // OpenCode auth.json 里的标准 OpenAI 兼容服务商（nvidia / modelscope）。
+    // 每个 provider 以自身名字注册为一个独立上游。
+    if let Some(explicit) = cli.opencode_auth_json.clone() {
+        std::env::set_var("OPENCODE_AUTH_JSON", explicit);
+    }
+    for (name, base_url, key) in upstream::opencode::auth::load_providers() {
+        if disabled(&name) {
+            continue;
+        }
+        map.insert(
+            name.clone(),
+            Arc::new(upstream::opencode::OpenCodeKeyUpstream::new(name, base_url, key)),
+        );
+    }
+
     map
 }
 
 fn preflight(state: &AppState) {
-    eprintln!("==== 预检 ====");
-    eprintln!("平台      : {}", std::env::consts::OS);
-    eprintln!("运行时    : rust/{}", env!("CARGO_PKG_VERSION"));
-    eprintln!("默认上游  : {}", state.default_upstream);
+    config::log("==== 预检 ====");
+    config::log(&format!("平台      : {}", std::env::consts::OS));
+    config::log(&format!("运行时    : rust/{}", env!("CARGO_PKG_VERSION")));
+    config::log(&format!("默认上游  : {}", state.default_upstream));
 
     let mut names: Vec<&String> = state.upstreams.keys().collect();
     names.sort();
     if names.is_empty() {
-        eprintln!("[警告] 没有可用的上游：未找到任何桌面端登录态。");
-        eprintln!("       · CodeBuddy: {}", auth::auth_dirs()
-            .iter()
-            .map(|d| d.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", "));
-        eprintln!("       · Trae:      {}", upstream::trae::auth::storage_json_candidates()
-            .iter()
-            .map(|d| d.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", "));
+        config::log("[警告] 没有可用的上游：未找到任何桌面端登录态。");
+        config::log(&format!(
+            "       · CodeBuddy: {}",
+            auth::auth_dirs()
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        config::log(&format!(
+            "       · Trae:      {}",
+            upstream::trae::auth::storage_json_candidates()
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     } else {
-        eprintln!("可用上游  : {names:?}");
+        config::log(&format!("可用上游  : {names:?}"));
     }
 
     if let Some(af) = auth::find_auth_file() {
-        eprintln!("CodeBuddy : {}", af.display());
+        config::log(&format!("CodeBuddy : {}", af.display()));
     }
     if let Some(sf) = upstream::trae::auth::find_storage_json() {
-        eprintln!("Trae      : {}", sf.display());
+        config::log(&format!("Trae      : {}", sf.display()));
     }
-    eprintln!("================");
+    if let Some(of) = upstream::opencode::auth::find_auth_json() {
+        config::log(&format!("OpenCode  : {}", of.display()));
+    }
+    config::log("================");
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -172,6 +206,12 @@ async fn main() {
     config::init_logger(log_target);
 
     let upstreams = build_upstreams(&cli);
+    let data_dir = cli
+        .data_dir
+        .clone()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(admin::default_data_dir);
+    let metrics = Arc::new(admin::MetricsStore::load(&data_dir));
     let state: SharedState = Arc::new(AppState {
         config: AppConfig {
             api_key: cli.api_key.clone(),
@@ -183,29 +223,35 @@ async fn main() {
         http: reqwest::Client::builder()
             .build()
             .expect("构建 HTTP 客户端失败"),
+        metrics,
+        data_dir: data_dir.clone(),
+        admin_enabled: !cli.no_admin,
     });
 
     if !cli.skip_check {
         preflight(&state);
     }
 
-    eprintln!(
-        "\n✅ 监听 http://{}:{}（默认上游：{}）",
+    config::log(&format!(
+        "✅ 监听 http://{}:{}（默认上游：{}）",
         cli.host, cli.port, cli.upstream
-    );
-    eprintln!("   GET  /v1/models");
-    eprintln!("   POST /v1/chat/completions   (原生 tools/tool_calls，支持流式)");
-    eprintln!("   POST /v1/responses          (Responses API，Codex CLI 兼容)");
-    eprintln!("   POST /v1/messages           (Anthropic API，Claude Code / CC Switch 兼容)");
-    eprintln!("   GET  /health");
-    eprintln!("   多上游前缀：/<upstream>/v1/... 与 /<upstream>/health");
-    if let Some(d) = &cli.log_dir {
-        eprintln!(
-            "   日志目录  : {d}/<日期>/converter-NNN.log（单文件 100MB 滚动）"
-        );
+    ));
+    if let Some(p) = &cli.log {
+        config::log(&format!("   日志文件  : {p}"));
     }
+    if let Some(d) = &cli.log_dir {
+        config::log(&format!(
+            "   日志目录  : {d}/<日期>/converter-NNN.log（单文件 100MB 滚动）"
+        ));
+    }
+    config::log("   GET  /v1/models");
+    config::log("   POST /v1/chat/completions   (原生 tools/tool_calls，支持流式)");
+    config::log("   POST /v1/responses          (Responses API，Codex CLI 兼容)");
+    config::log("   POST /v1/messages           (Anthropic API，Claude Code / CC Switch 兼容)");
+    config::log("   GET  /health");
+    config::log("   多上游前缀：/<upstream>/v1/... 与 /<upstream>/health");
     if !cli.api_key.is_empty() {
-        eprintln!("   鉴权已启用（API key 已设置）");
+        config::log("   鉴权已启用（API key 已设置）");
     }
     if cli.desensitize {
         let mode = if cli.no_compact {
@@ -213,9 +259,9 @@ async fn main() {
         } else {
             "零宽脱敏 + 压缩摘要"
         };
-        eprintln!("   脱敏      : 已启用（{mode}）");
+        config::log(&format!("   脱敏      : 已启用（{mode}）"));
     }
-    eprintln!("按 Ctrl+C 退出。\n");
+    config::log("按 Ctrl+C 退出。");
 
     config::log("==== converter 启动 ====");
 

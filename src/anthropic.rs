@@ -308,7 +308,49 @@ pub fn anthropic_request_to_chat(body: &Value) -> Result<Value, String> {
         }
     }
 
+    // Anthropic 的 thinking / effort → 上游的 reasoning_effort。
+    // Anthropic 客户端通过 `thinking` 对象（extended/adaptive）或 `effort` 表达“要思考”，
+    // 而上游（CodeBuddy 等）认的是 OpenAI 的 `reasoning_effort`，这里做映射。
+    // 注意：部分模型（如 deepseek-v4-flash）只有带上该字段才会输出 reasoning_content。
+    map_thinking_to_reasoning_effort(body, &mut chat);
+
     Ok(chat)
+}
+
+/// 把 Anthropic 请求里的思考意图映射为上游的 `reasoning_effort`。
+///
+/// - 显式 `effort`（low/medium/high/max）优先直接透传（max → high）。
+/// - `thinking.type == "enabled"`：按 `budget_tokens` 粗略映射（>=6000 high，否则 medium）。
+/// - `thinking.type == "adaptive"`：默认 high。
+fn map_thinking_to_reasoning_effort(body: &Value, chat: &mut Value) {
+    if let Some(effort) = body.get("effort").and_then(|e| e.as_str()) {
+        let mapped = match effort {
+            "max" | "high" => "high",
+            "medium" => "medium",
+            "low" => "low",
+            _ => "high",
+        };
+        chat["reasoning_effort"] = json!(mapped);
+        return;
+    }
+
+    let Some(thinking) = body.get("thinking") else {
+        return;
+    };
+    match thinking.get("type").and_then(|t| t.as_str()) {
+        Some("enabled") => {
+            let budget = thinking
+                .get("budget_tokens")
+                .and_then(|b| b.as_i64())
+                .unwrap_or(0);
+            let mapped = if budget >= 6000 { "high" } else { "medium" };
+            chat["reasoning_effort"] = json!(mapped);
+        }
+        Some("adaptive") => {
+            chat["reasoning_effort"] = json!("high");
+        }
+        _ => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +370,11 @@ pub struct AnthropicStreamConverter {
     msg_id: String,
     pub model: String,
     emitted_start: bool,
+
+    /// 思维链（OpenAI `reasoning_content`）→ Anthropic `thinking` block。
+    thinking_content: String,
+    thinking_block_open: bool,
+    thinking_block_idx: usize,
 
     text_content: String,
     text_block_open: bool,
@@ -354,6 +401,9 @@ impl AnthropicStreamConverter {
             msg_id: rand_id("msg_"),
             model: model.to_string(),
             emitted_start: false,
+            thinking_content: String::new(),
+            thinking_block_open: false,
+            thinking_block_idx: 0,
             text_content: String::new(),
             text_block_open: false,
             text_block_idx: 0,
@@ -384,6 +434,13 @@ impl AnthropicStreamConverter {
     pub fn finish(&mut self) -> String {
         let mut events: Vec<String> = Vec::new();
 
+        if self.thinking_block_open {
+            events.push(Self::evt(
+                "content_block_stop",
+                &json!({"index": self.thinking_block_idx}),
+            ));
+            self.thinking_block_open = false;
+        }
         if self.text_block_open {
             events.push(Self::evt(
                 "content_block_stop",
@@ -479,10 +536,45 @@ impl AnthropicStreamConverter {
             let delta = choice.get("delta").cloned().unwrap_or(json!({}));
             let finish = choice.get("finish_reason").and_then(|f| f.as_str());
 
+            // reasoning_content delta → Anthropic thinking block
+            // （CodeBuddy/腾讯后端把思维链放在 reasoning_content；Anthropic 用 thinking block 承载）
+            if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+                if !reasoning.is_empty() {
+                    self.thinking_content.push_str(reasoning);
+                    if !self.thinking_block_open {
+                        self.thinking_block_idx = self.next_block_idx;
+                        self.next_block_idx += 1;
+                        events.push(Self::evt(
+                            "content_block_start",
+                            &json!({
+                                "index": self.thinking_block_idx,
+                                "content_block": {"type": "thinking", "thinking": ""},
+                            }),
+                        ));
+                        self.thinking_block_open = true;
+                    }
+                    events.push(Self::evt(
+                        "content_block_delta",
+                        &json!({
+                            "index": self.thinking_block_idx,
+                            "delta": {"type": "thinking_delta", "thinking": reasoning},
+                        }),
+                    ));
+                }
+            }
+
             // content delta
             let content = delta.get("content").and_then(|c| c.as_str());
             if let Some(content) = content {
                 if !content.is_empty() {
+                    // 正文开始前，先收尾 thinking block（Anthropic 要求 thinking 在 text 之前）
+                    if self.thinking_block_open {
+                        events.push(Self::evt(
+                            "content_block_stop",
+                            &json!({"index": self.thinking_block_idx}),
+                        ));
+                        self.thinking_block_open = false;
+                    }
                     self.text_content.push_str(content);
                     if !self.text_block_open {
                         self.text_block_idx = self.next_block_idx;
@@ -559,22 +651,34 @@ impl AnthropicStreamConverter {
                 }
             }
 
+            // 仅当 finish_reason 非空时才收尾成块。
+            // 部分上游（CodeBuddy/腾讯）每个 chunk 都带 `finish_reason:""`，
+            // 若不做非空判断会逐 chunk 反复关闭/重开 block。
             if let Some(finish) = finish {
-                self.finish_reason = Some(finish.to_string());
-                if self.text_block_open {
-                    events.push(Self::evt(
-                        "content_block_stop",
-                        &json!({"index": self.text_block_idx}),
-                    ));
-                    self.text_block_open = false;
-                }
-                for tc in self.tool_uses.values_mut() {
-                    if tc.open {
+                if !finish.is_empty() {
+                    self.finish_reason = Some(finish.to_string());
+                    if self.thinking_block_open {
                         events.push(Self::evt(
                             "content_block_stop",
-                            &json!({"index": tc.block_idx}),
+                            &json!({"index": self.thinking_block_idx}),
                         ));
-                        tc.open = false;
+                        self.thinking_block_open = false;
+                    }
+                    if self.text_block_open {
+                        events.push(Self::evt(
+                            "content_block_stop",
+                            &json!({"index": self.text_block_idx}),
+                        ));
+                        self.text_block_open = false;
+                    }
+                    for tc in self.tool_uses.values_mut() {
+                        if tc.open {
+                            events.push(Self::evt(
+                                "content_block_stop",
+                                &json!({"index": tc.block_idx}),
+                            ));
+                            tc.open = false;
+                        }
                     }
                 }
             }
@@ -593,6 +697,9 @@ impl AnthropicStreamConverter {
 
     fn build_content_blocks(&self) -> Value {
         let mut blocks: Vec<Value> = Vec::new();
+        if !self.thinking_content.is_empty() || self.thinking_block_open {
+            blocks.push(json!({"type": "thinking", "thinking": self.thinking_content}));
+        }
         if !self.text_content.is_empty() || self.text_block_open {
             blocks.push(json!({"type": "text", "text": self.text_content}));
         }
@@ -786,6 +893,54 @@ mod tests {
         assert_eq!(chat["messages"][1], json!({"role": "assistant", "content": "Hi there"}));
     }
 
+    /// Anthropic thinking/effort → 上游 reasoning_effort 的映射。
+    #[test]
+    fn test_thinking_maps_to_reasoning_effort() {
+        // extended thinking，预算 >= 6000 → high
+        let req = json!({
+            "model": "m", "max_tokens": 16000,
+            "thinking": {"type": "enabled", "budget_tokens": 10000},
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let chat = anthropic_request_to_chat(&req).unwrap();
+        assert_eq!(chat["reasoning_effort"], "high");
+
+        // 小预算 → medium
+        let req = json!({
+            "model": "m", "max_tokens": 16000,
+            "thinking": {"type": "enabled", "budget_tokens": 2000},
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let chat = anthropic_request_to_chat(&req).unwrap();
+        assert_eq!(chat["reasoning_effort"], "medium");
+
+        // adaptive → high
+        let req = json!({
+            "model": "m", "max_tokens": 16000,
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let chat = anthropic_request_to_chat(&req).unwrap();
+        assert_eq!(chat["reasoning_effort"], "high");
+
+        // 显式 effort=low 优先
+        let req = json!({
+            "model": "m", "max_tokens": 16000, "effort": "low",
+            "thinking": {"type": "enabled", "budget_tokens": 10000},
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let chat = anthropic_request_to_chat(&req).unwrap();
+        assert_eq!(chat["reasoning_effort"], "low");
+
+        // 不带 thinking/effort → 不注入该字段
+        let req = json!({
+            "model": "m", "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let chat = anthropic_request_to_chat(&req).unwrap();
+        assert!(chat.get("reasoning_effort").is_none());
+    }
+
     #[test]
     fn test_stream_converter_text() {
         let mut conv = AnthropicStreamConverter::new("deepseek-v4-pro");
@@ -831,6 +986,62 @@ mod tests {
         let resp = conv.get_nonstream_response();
         assert_eq!(resp["stop_reason"], "end_turn");
         assert_eq!(resp["content"][0]["text"], "Hello world");
+    }
+
+    /// reasoning_content → Anthropic thinking block（思维链不得丢失）。
+    #[test]
+    fn test_stream_converter_reasoning_to_thinking() {
+        let mut conv = AnthropicStreamConverter::new("deepseek-v4-flash");
+        let chunks = [
+            r#"data: {"choices":[{"delta":{"reasoning_content":"Let me"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"reasoning_content":" think"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"391"},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "data: [DONE]",
+        ];
+        let mut all_events: Vec<Value> = Vec::new();
+        for line in chunks {
+            let result = conv.feed_line(line);
+            if !result.is_empty() {
+                all_events.extend(parse_events(&result));
+            }
+        }
+        all_events.extend(parse_events(&conv.finish()));
+
+        // thinking block 应存在，且其 start 在 text block 之前
+        let thinking_start = all_events
+            .iter()
+            .find(|e| {
+                e["type"] == "content_block_start"
+                    && e.pointer("/content_block/type") == Some(&json!("thinking"))
+            })
+            .expect("缺少 thinking content_block_start");
+        let text_start = all_events
+            .iter()
+            .find(|e| {
+                e["type"] == "content_block_start"
+                    && e.pointer("/content_block/type") == Some(&json!("text"))
+            })
+            .expect("缺少 text content_block_start");
+        assert!(thinking_start["index"].as_u64() < text_start["index"].as_u64());
+
+        // thinking_delta 文本累积正确
+        let thinking_text: String = all_events
+            .iter()
+            .filter(|e| {
+                e["type"] == "content_block_delta"
+                    && e.pointer("/delta/type") == Some(&json!("thinking_delta"))
+            })
+            .filter_map(|e| e.pointer("/delta/thinking").and_then(|t| t.as_str()))
+            .collect();
+        assert_eq!(thinking_text, "Let me think");
+
+        // 非流式响应：thinking block 在 text block 之前
+        let resp = conv.get_nonstream_response();
+        assert_eq!(resp["content"][0]["type"], "thinking");
+        assert_eq!(resp["content"][0]["thinking"], "Let me think");
+        assert_eq!(resp["content"][1]["type"], "text");
+        assert_eq!(resp["content"][1]["text"], "391");
     }
 
     #[test]

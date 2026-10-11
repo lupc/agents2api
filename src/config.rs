@@ -96,9 +96,24 @@ fn new_rotating_mode(dir: PathBuf, max_file_size: u64) -> LogMode {
 pub fn log(msg: &str) {
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     let line = format!("[{ts}] {msg}\n");
+    eprint!("{line}");
     if let Some(Some(logger)) = LOGGER.get().map(|o| o.as_ref()) {
         logger.write_line(&line);
     }
+}
+
+/// 拼接错误的完整 `source()` 链：`顶层: 来源: 根因`。
+///
+/// reqwest 的 Display 只给顶层消息（如 `error sending request for url (...)`），
+/// 真实原因（连接拒绝 / DNS 失败 / TLS 握手错误）挂在 source 链上，不展开就无法定位。
+pub fn err_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![e.to_string()];
+    let mut src = e.source();
+    while let Some(s) = src {
+        parts.push(s.to_string());
+        src = s.source();
+    }
+    parts.join(": ")
 }
 
 /// 带请求 id 前缀的日志便捷封装。
@@ -160,6 +175,12 @@ pub struct AppState {
     /// 无路径前缀时使用的默认上游名。
     pub default_upstream: String,
     pub http: reqwest::Client,
+    /// 请求统计（内存聚合 + 周期落盘）。
+    pub metrics: Arc<crate::admin::MetricsStore>,
+    /// 数据目录（统计 / 签到记录 / 后台配置）。
+    pub data_dir: PathBuf,
+    /// 是否启用管理后台（/admin/*）。
+    pub admin_enabled: bool,
 }
 
 impl AppState {
@@ -170,6 +191,14 @@ impl AppState {
             _ => self.default_upstream.as_str(),
         };
         self.upstreams.get(key).cloned()
+    }
+
+    /// 上游注册表快照（用于管理后台列举）。
+    pub(crate) fn upstreams_snapshot(&self) -> Vec<(String, Arc<dyn Upstream>)> {
+        self.upstreams
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 }
 

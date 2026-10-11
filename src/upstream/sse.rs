@@ -167,6 +167,8 @@ pub struct StreamStats {
     pub finish_reason: Option<String>,
     pub tool_names: Vec<String>,
     pub usage_total: Option<i64>,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
     pub saw_filter: bool,
     pub buf: Vec<u8>,
 }
@@ -195,6 +197,20 @@ impl StreamStats {
         if let Some(usage) = obj.get("usage") {
             if let Some(t) = usage.get("total_tokens").and_then(|v| v.as_i64()) {
                 self.usage_total = Some(t);
+            }
+            if let Some(p) = usage
+                .get("prompt_tokens")
+                .or_else(|| usage.get("input_tokens"))
+                .and_then(|v| v.as_u64())
+            {
+                self.prompt_tokens = p;
+            }
+            if let Some(c) = usage
+                .get("completion_tokens")
+                .or_else(|| usage.get("output_tokens"))
+                .and_then(|v| v.as_u64())
+            {
+                self.completion_tokens = c;
             }
         }
         if let Some(choices) = obj.get("choices").and_then(|c| c.as_array()) {
