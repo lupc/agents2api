@@ -24,7 +24,7 @@
         从上游模型目录接口拉取并替换本地缓存（倍率 / 思考档位 / 图片模态以服务端为准）。
       </div>
 
-      <!-- 详细目录表格（codebuddy 等提供完整元数据的上游） -->
+      <!-- 详细目录表格（buddy 等提供完整元数据的上游） -->
       <el-table v-if="isDetailed" :data="currentDetailed" size="small" stripe>
         <el-table-column prop="id" label="模型 ID" min-width="150" />
         <el-table-column prop="display" label="展示名" min-width="160" />
@@ -100,7 +100,7 @@ interface CatalogEntry {
 
 const syncing = ref(false)
 const saving = ref(false)
-const activeUpstream = ref('codebuddy')
+const activeUpstream = ref('buddy')
 const byUpstream = ref<Record<string, CatalogEntry>>({})
 const settings = ref({ daily_sync_enabled: false, daily_sync_time: '05:45' })
 

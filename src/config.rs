@@ -189,8 +189,15 @@ pub struct AppState {
 
 impl AppState {
     /// 按名字取上游；名字为 `None` 或空串时取默认上游。
+    ///
+    /// 兼容旧命名：路径前缀 `codebuddy` / `workbuddy` 均映射到 `buddy`
+    /// （2026-10 合并前的旧 base_url 不失效）。
     pub fn upstream(&self, name: Option<&str>) -> Option<Arc<dyn Upstream>> {
-        self.upstreams.get(name)
+        let mapped = name.map(|n| match n {
+            "codebuddy" | "workbuddy" => "buddy",
+            other => other,
+        });
+        self.upstreams.get(mapped)
     }
 
     /// 当前默认上游名（registry 内的，可能被后台配置覆盖）。

@@ -64,7 +64,7 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     skip_check: bool,
     /// 无路径前缀时使用的默认上游（codebuddy / trae）
-    #[arg(long, default_value = "codebuddy")]
+    #[arg(long, default_value = "buddy")]
     upstream: String,
     /// 禁用某个上游（可重复），如 --disable-upstream trae
     #[arg(long = "disable-upstream")]
@@ -220,7 +220,7 @@ async fn main() {
                 let now = chrono::Local::now();
                 let hhmm = now.format("%H:%M").to_string();
                 let today = now.format("%Y-%m-%d").to_string();
-                let has_syncable = st.upstream(Some("codebuddy")).is_some()
+                let has_syncable = st.upstream(Some("buddy")).is_some()
                     || st.upstream(Some("trae")).is_some();
                 if hhmm == settings.daily_sync_time
                     && settings.last_sync_date != today

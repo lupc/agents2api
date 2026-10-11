@@ -32,12 +32,12 @@ pub trait Upstream: Send + Sync {
 | 路径 | 上游 |
 |------|------|
 | `/v1/*`、`/health` | 默认上游（`--upstream`，默认 `codebuddy`） |
-| `/codebuddy/v1/*`、`/workbuddy/v1/*` | CodeBuddy / WorkBuddy（**同一上游的两个别名**） |
+| `/buddy/v1/*` | Buddy（原 codebuddy + workbuddy 合并；旧前缀 `/codebuddy`、`/workbuddy` 仍兼容可用） |
 | `/trae/v1/*`、`/trae/health` | 强制 Trae |
 | `/nvidia/v1/*`、`/nvidia/health` | OpenCode `auth.json` 里的 NVIDIA 服务商 |
 | `/modelscope/v1/*`、`/modelscope/health` | OpenCode `auth.json` 里的 ModelScope 服务商 |
 
-> **关于 `codebuddy` 与 `workbuddy`**：二者是同一个上游。WorkBuddy 与 CodeBuddy 共用同一套登录态文件（`CodeBuddyExtension/.../auth/*.info`，优先读 `workbuddy-desktop.info`）和同一个后端 `copilot.tencent.com`。两个前缀都可用，指向同一实例。
+> **关于 Buddy**：CodeBuddy 与 WorkBuddy 是同一个上游（共用登录态文件 `CodeBuddyExtension/.../auth/*.info` 与后端 `copilot.tencent.com`），已合并为单一 `buddy` 上游；旧路径前缀 `/codebuddy/*`、`/workbuddy/*` 自动映射到 buddy，历史配置不失效。
 
 > **关于 `nvidia` / `modelscope`**：这两个上游读取本机 **OpenCode** 的 `auth.json`（`~/.local/share/opencode/auth.json`），把其中标准 OpenAI 兼容的服务商 key 暴露出来。每个 provider 以自身名字注册为一个独立上游，走后端各自的 OpenAI 兼容端点。
 

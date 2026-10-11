@@ -118,7 +118,7 @@ fn normalize_tool_choice(body: &mut Value) {
 #[async_trait::async_trait]
 impl Upstream for CodeBuddyUpstream {
     fn name(&self) -> &str {
-        "codebuddy"
+        "buddy"
     }
 
     async fn prepare_chat(&self, chat: &Value) -> Result<UpstreamRequest, String> {

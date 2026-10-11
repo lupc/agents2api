@@ -65,13 +65,42 @@ pub struct UpstreamsConfig {
 impl UpstreamsConfig {
     pub fn load(data_dir: &Path) -> Self {
         let path = data_dir.join("upstreams.json");
-        std::fs::read_to_string(&path)
+        let mut cfg: Self = std::fs::read_to_string(&path)
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or(Self {
                 default_upstream: None,
                 upstreams: HashMap::new(),
-            })
+            });
+        cfg.migrate_legacy_names();
+        cfg
+    }
+
+    /// 旧版命名迁移：codebuddy / workbuddy → buddy（enabled 取或、backend 继承）。
+    fn migrate_legacy_names(&mut self) {
+        let legacy: Vec<(String, UpstreamOverride)> = self
+            .upstreams
+            .iter()
+            .filter(|(k, _)| k.as_str() == "codebuddy" || k.as_str() == "workbuddy")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if legacy.is_empty() {
+            return;
+        }
+        for (old, o) in legacy {
+            self.upstreams.remove(&old);
+            let entry = self.upstreams.entry("buddy".to_string()).or_default();
+            entry.enabled = entry.enabled || o.enabled;
+            if entry.backend.is_none() {
+                entry.backend = o.backend;
+            }
+        }
+        // 旧默认上游名迁移
+        if let Some(d) = &self.default_upstream {
+            if d == "codebuddy" || d == "workbuddy" {
+                self.default_upstream = Some("buddy".to_string());
+            }
+        }
     }
 
     pub fn save(data_dir: &Path, cfg: &UpstreamsConfig) -> Result<(), String> {
@@ -110,19 +139,22 @@ pub fn build_registry(
     use crate::upstream::trae::{auth::TraeCredential, TraeUpstream};
 
     let mut map: HashMap<String, Arc<dyn Upstream>> = HashMap::new();
-    let disabled = |name: &str| !overrides.enabled(name, cli_disabled.iter().any(|d| d == name));
+    // --disable-upstream 兼容旧命名
+    let cli_disabled_buddy = cli_disabled
+        .iter()
+        .any(|d| d == "buddy" || d == "codebuddy" || d == "workbuddy");
+    let disabled = |name: &str| !overrides.enabled(name, false);
 
-    // CodeBuddy / WorkBuddy 同一上游、两个别名
-    if !disabled("codebuddy") && !disabled("workbuddy") {
+    // Buddy（原 codebuddy / workbuddy 合并；凭据同一份 CodeBuddyExtension auth 文件）
+    if !disabled("buddy") && !cli_disabled_buddy {
         if let Some(path) = crate::auth::find_auth_file() {
             let backend = overrides
-                .ov("codebuddy")
+                .ov("buddy")
                 .and_then(|o| o.backend.clone())
                 .or_else(|| base.codebuddy_backend.clone());
             let inst: Arc<dyn Upstream> =
                 Arc::new(CodeBuddyUpstream::new(CredentialManager::new(path), backend));
-            map.insert("codebuddy".to_string(), inst.clone());
-            map.insert("workbuddy".to_string(), inst);
+            map.insert("buddy".to_string(), inst);
         }
     }
 
@@ -166,14 +198,14 @@ pub fn build_registry(
     let default = overrides
         .default_upstream
         .clone()
-        .unwrap_or_else(|| "codebuddy".to_string());
+        .unwrap_or_else(|| "buddy".to_string());
     UpstreamRegistry::new(map, default)
 }
 
 /// 把配置转成前端可编辑的视图（含当前生效值，文件覆盖 + CLI 兜底合并后）。
 pub fn config_view(cfg: &UpstreamsConfig, base: &BaseSettings) -> Value {
-    let codebuddy_backend = cfg
-        .ov("codebuddy")
+    let buddy_backend = cfg
+        .ov("buddy")
         .and_then(|o| o.backend.clone())
         .or_else(|| base.codebuddy_backend.clone());
     let trae_chat_host = cfg
@@ -181,13 +213,12 @@ pub fn config_view(cfg: &UpstreamsConfig, base: &BaseSettings) -> Value {
         .and_then(|o| o.chat_host.clone())
         .or_else(|| base.trae_chat_host.clone());
     serde_json::json!({
-        "default_upstream": cfg.default_upstream.clone().unwrap_or_else(|| "codebuddy".to_string()),
+        "default_upstream": cfg.default_upstream.clone().unwrap_or_else(|| "buddy".to_string()),
         "upstreams": {
-            "codebuddy": {
-                "enabled": cfg.enabled("codebuddy", false),
-                "backend": codebuddy_backend,
+            "buddy": {
+                "enabled": cfg.enabled("buddy", false),
+                "backend": buddy_backend,
             },
-            "workbuddy": { "enabled": cfg.enabled("workbuddy", false) },
             "trae": {
                 "enabled": cfg.enabled("trae", false),
                 "chat_host": trae_chat_host,
@@ -195,4 +226,50 @@ pub fn config_view(cfg: &UpstreamsConfig, base: &BaseSettings) -> Value {
             "opencode": { "enabled": cfg.enabled("opencode", false) },
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 旧命名（codebuddy/workbuddy 分开的覆盖项）迁移到 buddy。
+    #[test]
+    fn test_migrate_legacy_names() {
+        let mut cfg = UpstreamsConfig {
+            default_upstream: Some("workbuddy".to_string()),
+            upstreams: HashMap::from([
+                (
+                    "codebuddy".to_string(),
+                    UpstreamOverride { enabled: true, backend: Some("https://cb.example".into()), ..Default::default() },
+                ),
+                (
+                    "workbuddy".to_string(),
+                    UpstreamOverride { enabled: false, backend: None, ..Default::default() },
+                ),
+            ]),
+        };
+        cfg.migrate_legacy_names();
+        assert!(cfg.upstreams.get("codebuddy").is_none());
+        assert!(cfg.upstreams.get("workbuddy").is_none());
+        let buddy = &cfg.upstreams["buddy"];
+        // enabled 取或；backend 继承 codebuddy 的
+        assert!(buddy.enabled);
+        assert_eq!(buddy.backend.as_deref(), Some("https://cb.example"));
+        assert_eq!(cfg.default_upstream.as_deref(), Some("buddy"));
+    }
+
+    /// 无旧命名时不产生 buddy 键（避免污染配置文件）。
+    #[test]
+    fn test_migrate_noop_without_legacy() {
+        let mut cfg = UpstreamsConfig {
+            default_upstream: None,
+            upstreams: HashMap::from([(
+                "trae".to_string(),
+                UpstreamOverride { enabled: true, ..Default::default() },
+            )]),
+        };
+        cfg.migrate_legacy_names();
+        assert!(cfg.upstreams.get("buddy").is_none());
+        assert_eq!(cfg.default_upstream, None);
+    }
 }

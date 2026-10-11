@@ -197,7 +197,7 @@ pub async fn sync_models_inner(st: &AdminState) -> Value {
             Ok(models) => {
                 // 同步成功后即刻写入内存快照（models() 立即消费）；
                 // 同时落盘（重启时 load_*_catalog_snapshot 恢复）
-                if name == "codebuddy" {
+                if name == "buddy" {
                     crate::upstream::codebuddy_catalog::set_catalog_snapshot(models.clone());
                     if let Err(e) = crate::upstream::codebuddy_catalog::save_catalog_snapshot(
                         &st.data_dir,

@@ -35,9 +35,9 @@
         <el-table-column label="模型数" width="90">
           <template #default="{ row }">{{ row.model_count ?? '-' }}</template>
         </el-table-column>
-        <el-table-column label="后端地址覆盖（codebuddy）">
+        <el-table-column label="后端地址覆盖（buddy）">
           <template #default="{ row }">
-            <el-input v-if="row.name === 'codebuddy'" v-model="row.backend" placeholder="留空用默认 https://copilot.tencent.com" />
+            <el-input v-if="row.name === 'buddy'" v-model="row.backend" placeholder="留空用默认 https://copilot.tencent.com" />
             <span v-else class="dim">—</span>
           </template>
         </el-table-column>
@@ -75,7 +75,7 @@ interface Row {
   healthSummary: string
 }
 
-const knownNames = ['codebuddy', 'workbuddy', 'trae', 'opencode']
+const knownNames = ['buddy', 'trae', 'opencode']
 
 const rows = computed<Row[]>(() => {
   const names = new Set<string>([...Object.keys(cfg.value.upstreams), ...knownNames])
