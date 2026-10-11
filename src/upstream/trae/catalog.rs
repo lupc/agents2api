@@ -45,7 +45,8 @@ fn is_internal(name: &str) -> bool {
 }
 
 fn effort_rank(e: &str) -> usize {
-    ["minimal", "low", "medium", "high", "xhigh", "max"]
+    // Trae 档位命名（light/extra_high）与 Buddy（low/medium/high/max）并轨排序
+    ["minimal", "light", "low", "medium", "high", "extra_high", "xhigh", "max"]
         .iter()
         .position(|o| *o == e)
         .unwrap_or(usize::MAX)
@@ -111,6 +112,14 @@ fn extract_meta(ci: &Value) -> (Option<f64>, Option<u64>, Option<u64>, Vec<Strin
     .collect::<Vec<_>>();
     efforts.sort_by_key(|e| effort_rank(e));
     efforts.dedup();
+    // 实测（2026-10 真机响应）：档位在 reasoning_effort_config.options
+    // （如 ["light","high","extra_high"]），并带 default_level / support_thinking。
+    // 参考实现挖的顶层 efforts/thinking_modes 键在该形态下不存在。
+    if efforts.is_empty() {
+        if let Some(rec) = ci.get("reasoning_effort_config") {
+            efforts = dig_strs(rec, &["options"]);
+        }
+    }
     let supports_image = ci
         .get("display_config")
         .and_then(|d| dig_bool(d, &["multimodal"]));
@@ -312,8 +321,8 @@ mod tests {
                     {"config_name": "DeepSeek-V4-Pro", "display_config": {"display_name": "Deepseek-V4-Pro", "multimodal": true},
                      "context_window_tokens": {"dev": 168000, "max": 1000000},
                      "display_contact_config": "{\"consumption_rate\":{\"enable\":true,\"data\":{\"rate\":\"0.16\"}}}",
-                     "model_detail_list": [{"model_name": "DeepSeek-V4-Pro__dev"}],
-                     "efforts": ["high"]},
+                     "reasoning_effort_config": {"default_level": "high", "options": ["light", "high", "extra_high"], "support_thinking": true},
+                     "model_detail_list": [{"model_name": "DeepSeek-V4-Pro__dev"}]},
                     {"config_name": "glm-5.1", "display_config": {"display_name": "GLM-5.1"},
                      "context_window_tokens": {"max": 200000}}
                 ]},
@@ -332,7 +341,8 @@ mod tests {
         assert_eq!(out[0].rate, 0.16);
         assert_eq!(out[0].context_length, 168000);
         assert_eq!(out[0].max_tokens, 1000000);
-        assert_eq!(out[0].efforts, vec!["high"]);
+        // 实测字段链：reasoning_effort_config.options（light/high/extra_high 命名）
+        assert_eq!(out[0].efforts, vec!["light", "high", "extra_high"]);
         assert!(out[0].supports_image);
         assert_eq!(out[0].vendor, "DeepSeek");
     }
