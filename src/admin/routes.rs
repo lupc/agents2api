@@ -15,14 +15,6 @@ use serde_json::{json, Value};
 use super::AdminState;
 use super::config_store;
 
-fn not_yet(what: &str) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({"error": {"message": format!("{what} 尚未实现"), "type": "not_implemented"}})),
-    )
-        .into_response()
-}
-
 #[derive(Deserialize)]
 pub struct DaysQuery {
     #[serde(default = "default_days")]
@@ -229,21 +221,38 @@ pub async fn sync_models(State(st): State<AdminState>) -> Response {
     .into_response()
 }
 
-// ---- Phase 3 占位 ----
+// ---- Phase 3：Trae 签到 / 积分 ----
 
-/// `POST /admin/api/checkin/trae`
-pub async fn checkin_trae(State(_st): State<AdminState>) -> Response {
-    not_yet("Trae 签到")
+/// `POST /admin/api/checkin/trae` — 一键签到。
+pub async fn checkin_trae(State(st): State<AdminState>) -> Response {
+    match super::checkin::run_checkin(&st).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": {"message": e}})),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /admin/api/checkin/results?days=30`
-pub async fn checkin_results(State(_st): State<AdminState>, Query(_q): Query<DaysQuery>) -> Response {
-    not_yet("签到记录")
+pub async fn checkin_results(
+    State(st): State<AdminState>,
+    Query(q): Query<DaysQuery>,
+) -> Response {
+    Json(super::checkin::results(&st, q.days.clamp(1, 365))).into_response()
 }
 
 /// `GET /admin/api/credits/trae`
-pub async fn credits_trae(State(_st): State<AdminState>) -> Response {
-    not_yet("Trae 积分")
+pub async fn credits_trae(State(st): State<AdminState>) -> Response {
+    match super::credits::fetch(&st).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": {"message": e}})),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /admin/api/logs?lines=200`
