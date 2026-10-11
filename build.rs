@@ -3,8 +3,8 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let mut res = winresource::WindowsResource::new();
         res.set("FileDescription", "CodeBuddy/WorkBuddy to OpenAI/Anthropic compatible local API converter");
-        res.set("ProductName", "codebuddy2api-rs");
-        res.set("OriginalFilename", "codebuddy2api.exe");
+        res.set("ProductName", "agents2api");
+        res.set("OriginalFilename", "agents2api.exe");
         res.set("LegalCopyright", "MIT License");
         if let Err(e) = res.compile() {
             // 资源编译失败不应阻塞构建

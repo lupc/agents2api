@@ -1,5 +1,5 @@
 [package]
-name = "codebuddy2api"
+name = "agents2api"
 version = "2.0.0"
 edition = "2021"
 description = "CodeBuddy/WorkBuddy subscription to OpenAI/Anthropic-compatible local API, in Rust"

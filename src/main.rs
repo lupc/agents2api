@@ -1,4 +1,4 @@
-//! codebuddy2api-rs — 把 CodeBuddy / WorkBuddy / Trae 的订阅暴露成标准
+//! agents2api — 把 CodeBuddy / WorkBuddy / Trae 的订阅暴露成标准
 //! OpenAI / Anthropic 兼容 API。
 //!
 //! 原理（直连后端，原生 function calling）：
@@ -38,7 +38,7 @@ pub fn rand_hex(n: usize) -> String {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "codebuddy2api",
+    name = "agents2api",
     version,
     about = "CodeBuddy / Trae -> OpenAI 兼容转换器（直连后端）"
 )]

@@ -1,4 +1,4 @@
-# codebuddy2api-rs
+# agents2api
 
 [原项目 codebuddy2api](https://github.com/ShouZhuo0413/codebuddy2api)（Python / FastAPI）的 **Rust 重写版**，并在其基础上做了**上游可插拔重构**，新增 **Trae** 上游支持。
 
@@ -84,21 +84,21 @@ cd agents2api
 
 # 开发构建（快，未优化，产物大）
 cargo build
-# → target/debug/codebuddy2api(.exe)
+# → target/debug/agents2api(.exe)
 
 # 发布构建（推荐，opt-level=2 + strip）
 cargo build --release
-# → target/release/codebuddy2api(.exe)  约 7.3 MB
+# → target/release/agents2api(.exe)  约 7.3 MB
 ```
 
 产物是**单文件静态二进制**，无需运行时依赖，直接拷走即可运行：
 
 ```bash
 # Windows
-target\release\codebuddy2api.exe --help
+target\release\agents2api.exe --help
 
 # Linux / macOS
-./target/release/codebuddy2api --help
+./target/release/agents2api --help
 ```
 
 ### 运行测试
@@ -126,12 +126,12 @@ cargo fmt                        # 格式化
 ```bash
 # Linux / macOS
 mkdir -p dist
-cp target/release/codebuddy2api dist/
+cp target/release/agents2api dist/
 cp README.md dist/
 
 # Windows (Git Bash)
 mkdir -p dist
-cp target/release/codebuddy2api.exe dist/
+cp target/release/agents2api.exe dist/
 cp README.md dist/
 ```
 
@@ -155,8 +155,8 @@ cargo build --release --target x86_64-unknown-linux-gnu
 
 | 路径 | 说明 |
 |------|------|
-| `target/debug/codebuddy2api` | 开发构建，含调试符号，编译快 |
-| `target/release/codebuddy2api` | 发布构建，已 strip，体积小、运行快 |
+| `target/debug/agents2api` | 开发构建，含调试符号，编译快 |
+| `target/release/agents2api` | 发布构建，已 strip，体积小、运行快 |
 | `target/release/build/` | 构建脚本产物（winresource 写入的版本信息资源） |
 
 ### 常见问题
@@ -168,10 +168,10 @@ cargo build --release --target x86_64-unknown-linux-gnu
 
 ```bash
 # Windows
-taskkill /F /IM codebuddy2api.exe
+taskkill /F /IM agents2api.exe
 
 # Linux / macOS
-pkill -f codebuddy2api
+pkill -f agents2api
 ```
 
 **构建很慢**：首次构建需编译全部依赖（约 1–2 分钟），后续增量构建只需几秒。
@@ -181,13 +181,13 @@ pkill -f codebuddy2api
 
 ```bash
 # 默认 127.0.0.1:8787，默认上游 codebuddy
-codebuddy2api.exe
+agents2api.exe
 
 # 默认走 Trae；两个上游都自动探测并注册
-codebuddy2api.exe --upstream trae --api-key mysecret --log converter.log
+agents2api.exe --upstream trae --api-key mysecret --log converter.log
 
 # 只启用某一个上游
-codebuddy2api.exe --disable-upstream codebuddy
+agents2api.exe --disable-upstream codebuddy
 ```
 
 ### CLI 参数
@@ -229,10 +229,10 @@ codebuddy2api.exe --disable-upstream codebuddy
 
 ```bash
 # 方式一：单文件追加（不滚动，适合短期调试）
-codebuddy2api.exe --log converter.log
+agents2api.exe --log converter.log
 
 # 方式二：按日期分目录 + 滚动（推荐长期运行）
-codebuddy2api.exe --log-dir logs
+agents2api.exe --log-dir logs
 ```
 
 `--log-dir` 的产出结构：
