@@ -3,5 +3,7 @@ target/
 converter.log
 .zcode/
 /dist/
+/data/
 *.exe
 web/node_modules/
+web/tsconfig.tsbuildinfo
