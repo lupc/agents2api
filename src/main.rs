@@ -23,11 +23,7 @@ mod wbcrypto;
 
 use clap::Parser;
 use config::{AppConfig, AppState, SharedState};
-use std::collections::HashMap;
 use std::sync::Arc;
-use upstream::codebuddy::CodeBuddyUpstream;
-use upstream::trae::{auth::TraeCredential, TraeUpstream};
-use upstream::Upstream;
 
 /// n 字节随机数的十六进制表示（2n 个字符）。
 pub fn rand_hex(n: usize) -> String {
@@ -93,69 +89,27 @@ struct Cli {
     no_admin: bool,
 }
 
-/// 构建上游注册表。
-fn build_upstreams(cli: &Cli) -> HashMap<String, Arc<dyn Upstream>> {
-    let mut map: HashMap<String, Arc<dyn Upstream>> = HashMap::new();
-    let disabled = |name: &str| cli.disable_upstream.iter().any(|d| d == name);
-
-    // CodeBuddy / WorkBuddy 是同一个上游：二者共用登录态文件与后端
-    // （auth 目录为 CodeBuddyExtension，优先读 workbuddy-desktop.info）。
-    // 两个名字都注册，避免用户按自己安装的客户端名调用时 404。
-    if !disabled("codebuddy") && !disabled("workbuddy") {
-        if let Some(path) = auth::find_auth_file() {
-            let cred = auth::CredentialManager::new(path);
-            let inst: Arc<dyn Upstream> = Arc::new(CodeBuddyUpstream::new(
-                cred,
-                cli.codebuddy_backend.clone(),
-            ));
-            map.insert("codebuddy".to_string(), inst.clone());
-            map.insert("workbuddy".to_string(), inst);
-        }
+/// 从 CLI 提取重建注册表所需的基础设置。
+fn base_settings(cli: &Cli) -> admin::config_store::BaseSettings {
+    admin::config_store::BaseSettings {
+        codebuddy_backend: cli.codebuddy_backend.clone(),
+        trae_chat_host: cli.trae_chat_host.clone(),
+        trae_storage_json: cli.trae_storage_json.clone(),
+        opencode_auth_json: cli.opencode_auth_json.clone(),
     }
-
-    // Trae
-    if !disabled("trae") {
-        let storage = cli
-            .trae_storage_json
-            .clone()
-            .map(std::path::PathBuf::from)
-            .or_else(upstream::trae::auth::find_storage_json);
-        if let Some(path) = storage {
-            map.insert(
-                "trae".to_string(),
-                Arc::new(TraeUpstream::new(
-                    TraeCredential::new(path),
-                    cli.trae_chat_host.clone(),
-                )),
-            );
-        }
-    }
-
-    // OpenCode auth.json 里的标准 OpenAI 兼容服务商（nvidia / modelscope）。
-    // 每个 provider 以自身名字注册为一个独立上游。
-    if let Some(explicit) = cli.opencode_auth_json.clone() {
-        std::env::set_var("OPENCODE_AUTH_JSON", explicit);
-    }
-    for (name, base_url, key) in upstream::opencode::auth::load_providers() {
-        if disabled(&name) {
-            continue;
-        }
-        map.insert(
-            name.clone(),
-            Arc::new(upstream::opencode::OpenCodeKeyUpstream::new(name, base_url, key)),
-        );
-    }
-
-    map
 }
 
 fn preflight(state: &AppState) {
     config::log("==== 预检 ====");
     config::log(&format!("平台      : {}", std::env::consts::OS));
     config::log(&format!("运行时    : rust/{}", env!("CARGO_PKG_VERSION")));
-    config::log(&format!("默认上游  : {}", state.default_upstream));
+    config::log(&format!("默认上游  : {}", state.default_upstream()));
 
-    let mut names: Vec<&String> = state.upstreams.keys().collect();
+    let mut names: Vec<String> = state
+        .upstreams_snapshot()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
     names.sort();
     if names.is_empty() {
         config::log("[警告] 没有可用的上游：未找到任何桌面端登录态。");
@@ -205,28 +159,47 @@ async fn main() {
     };
     config::init_logger(log_target);
 
-    let upstreams = build_upstreams(&cli);
+    let base = base_settings(&cli);
     let data_dir = cli
         .data_dir
         .clone()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(admin::default_data_dir);
     let metrics = Arc::new(admin::MetricsStore::load(&data_dir));
+    // 启动即合并文件覆盖项（<data_dir>/upstreams.json），CLI 默认上游仅作文件缺省兜底
+    let mut cfg = admin::config_store::UpstreamsConfig::load(&data_dir);
+    if cfg.default_upstream.is_none() {
+        cfg.default_upstream = Some(cli.upstream.clone());
+    }
+    let registry = admin::config_store::build_registry(&base, &cli.disable_upstream, &cfg);
     let state: SharedState = Arc::new(AppState {
         config: AppConfig {
             api_key: cli.api_key.clone(),
             desensitize: cli.desensitize,
             no_compact: cli.no_compact,
         },
-        upstreams,
-        default_upstream: cli.upstream.clone(),
+        upstreams: registry,
+        registry_base: base,
+        cli_default_upstream: cli.upstream.clone(),
         http: reqwest::Client::builder()
             .build()
             .expect("构建 HTTP 客户端失败"),
-        metrics,
+        metrics: metrics.clone(),
         data_dir: data_dir.clone(),
         admin_enabled: !cli.no_admin,
     });
+
+    // 统计周期落盘（2s 节流在 MetricsStore 内部）
+    {
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                metrics.flush_if_due();
+            }
+        });
+    }
 
     if !cli.skip_check {
         preflight(&state);

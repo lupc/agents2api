@@ -1,6 +1,6 @@
 //! 应用配置、共享状态与文件日志。
 
-use std::collections::HashMap;
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -170,10 +170,12 @@ fn append_line(path: &PathBuf, line: &str) -> std::io::Result<()> {
 /// 共享应用状态。
 pub struct AppState {
     pub config: AppConfig,
-    /// 已配置的上游（key = 上游名，如 `codebuddy` / `trae`）。
-    pub upstreams: HashMap<String, Arc<dyn Upstream>>,
-    /// 无路径前缀时使用的默认上游名。
-    pub default_upstream: String,
+    /// 上游注册表（内部 RwLock，支持管理后台 reload 热替换）。
+    pub upstreams: crate::upstream::UpstreamRegistry,
+    /// 重建注册表所需的基础设置（CLI/env；reload 时作为文件未覆盖字段的兜底）。
+    pub registry_base: crate::admin::config_store::BaseSettings,
+    /// 请求启动时的 CLI 默认上游（文件配置可能覆盖，实际默认以 registry 为准）。
+    pub cli_default_upstream: String,
     pub http: reqwest::Client,
     /// 请求统计（内存聚合 + 周期落盘）。
     pub metrics: Arc<crate::admin::MetricsStore>,
@@ -186,19 +188,17 @@ pub struct AppState {
 impl AppState {
     /// 按名字取上游；名字为 `None` 或空串时取默认上游。
     pub fn upstream(&self, name: Option<&str>) -> Option<Arc<dyn Upstream>> {
-        let key = match name {
-            Some(n) if !n.is_empty() => n,
-            _ => self.default_upstream.as_str(),
-        };
-        self.upstreams.get(key).cloned()
+        self.upstreams.get(name)
+    }
+
+    /// 当前默认上游名（registry 内的，可能被后台配置覆盖）。
+    pub fn default_upstream(&self) -> String {
+        self.upstreams.default_name()
     }
 
     /// 上游注册表快照（用于管理后台列举）。
     pub(crate) fn upstreams_snapshot(&self) -> Vec<(String, Arc<dyn Upstream>)> {
-        self.upstreams
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+        self.upstreams.snapshot()
     }
 }
 

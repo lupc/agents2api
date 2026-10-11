@@ -182,7 +182,11 @@ fn resolve_upstream(
         Some(u) => Ok(u),
         None => {
             let asked = requested.unwrap_or("(默认)");
-            let available: Vec<&str> = state.upstreams.keys().map(|s| s.as_str()).collect();
+            let available: Vec<String> = state
+                .upstreams_snapshot()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect();
             Err(err_detail(
                 StatusCode::NOT_FOUND,
                 json!({
@@ -1398,8 +1402,9 @@ mod tests {
                 desensitize: false,
                 no_compact: false,
             },
-            upstreams,
-            default_upstream: "trae".to_string(),
+            upstreams: crate::upstream::UpstreamRegistry::new(upstreams, "trae".to_string()),
+            registry_base: Default::default(),
+            cli_default_upstream: "trae".to_string(),
             http: reqwest::Client::new(),
             metrics: std::sync::Arc::new(crate::admin::MetricsStore::load(
                 &std::env::temp_dir().join("agents2api-test-metrics"),
@@ -1511,8 +1516,9 @@ mod tests {
                 desensitize: false,
                 no_compact: false,
             },
-            upstreams,
-            default_upstream: "trae".to_string(),
+            upstreams: crate::upstream::UpstreamRegistry::new(upstreams, "trae".to_string()),
+            registry_base: Default::default(),
+            cli_default_upstream: "trae".to_string(),
             http: reqwest::Client::new(),
             metrics: std::sync::Arc::new(crate::admin::MetricsStore::load(
                 &std::env::temp_dir().join("agents2api-test-metrics"),

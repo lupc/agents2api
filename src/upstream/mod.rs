@@ -50,8 +50,77 @@ pub trait Upstream: Send + Sync {
     /// 该上游可用的模型 id 列表。
     async fn models(&self) -> Vec<String>;
 
+    /// 模型同步：默认等价 [`Self::models`]；个别上游可覆盖为远程目录拉取
+    /// （如 Trae 的 batch_get_detail_param），失败时回退 [`Self::models`]。
+    async fn sync_models(&self) -> Vec<String> {
+        self.models().await
+    }
+
     /// 健康检查附带的账号/状态信息。
     async fn health_info(&self) -> Value;
+}
+
+// ---------------------------------------------------------------------------
+// 上游注册表（内部 RwLock，支持管理后台热重载）
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+#[derive(Default)]
+struct RegistryInner {
+    map: HashMap<String, Arc<dyn Upstream>>,
+    default: String,
+}
+
+/// 上游注册表：读多写少，写只发生在启动与管理后台 reload。
+pub struct UpstreamRegistry {
+    inner: RwLock<RegistryInner>,
+}
+
+impl UpstreamRegistry {
+    pub fn new(map: HashMap<String, Arc<dyn Upstream>>, default: String) -> Self {
+        Self {
+            inner: RwLock::new(RegistryInner { map, default }),
+        }
+    }
+
+    /// 按名字取上游；`None` / 空串取默认上游。
+    pub fn get(&self, name: Option<&str>) -> Option<Arc<dyn Upstream>> {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        let key = match name {
+            Some(n) if !n.is_empty() => n,
+            _ => inner.default.as_str(),
+        };
+        inner.map.get(key).cloned()
+    }
+
+    /// 快照（供管理后台列举）。
+    pub fn snapshot(&self) -> Vec<(String, Arc<dyn Upstream>)> {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner
+            .map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    pub fn default_name(&self) -> String {
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).default.clone()
+    }
+
+    /// 整体替换（reload）：接管另一个 registry 的内容。
+    pub fn replace(&self, other: UpstreamRegistry) {
+        let other = other.inner.into_inner().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        inner.map = other.map;
+        inner.default = other.default;
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).map.len()
+    }
+
 }
 
 /// 用 [`ChatAggregator`] 聚合标准 OpenAI SSE 的默认实现（CodeBuddy / Trae 转义后均适用）。

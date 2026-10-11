@@ -39,6 +39,90 @@ impl TraeUpstream {
     async fn info(&self) -> Result<TraeAuthInfo, String> {
         self.cred.info().await
     }
+
+    /// 从 Trae 模型网关拉取真实模型目录。
+    ///
+    /// 端点与请求头来自参考实现（batch_get_detail_param，需 `x-bridge-transport: aha`）。
+    /// 响应结构未完全公开，这里防御性解析：递归收集所有 `config_name` 字符串值；
+    /// 任何失败都返回 Err 由调用方回退。
+    async fn fetch_remote_models(&self) -> Result<Vec<String>, String> {
+        let info = self.info().await?;
+        let host = std::env::var("TRAE_MODEL_API_HOST")
+            .unwrap_or_else(|_| "https://api5-normal.mchost.guru".to_string());
+        let url = format!("{host}/api/ide/v1/batch_get_detail_param");
+        let body = serde_json::json!({
+            "functions": ["solo_work_lite", "solo_agent"],
+            "config_names": null,
+            "need_prompt": false,
+            "current_config_info": null,
+            "poly_prompt": true,
+            "mode_type": null,
+            "agent_type": null,
+        });
+        let mut headers = protocol::build_headers(&info, false);
+        headers.push(("x-bridge-transport".to_string(), "aha".to_string()));
+        headers.push(("Accept".to_string(), "application/json".to_string()));
+
+        let client = reqwest::Client::new();
+        let mut req = client.post(&url).json(&body);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let resp = req
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| format!("请求失败: {e}"))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("读取响应失败: {e}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "HTTP {status}: {}",
+                text.chars().take(200).collect::<String>()
+            ));
+        }
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|e| {
+                let head: String = text.chars().take(300).collect();
+                format!("响应解析失败: {e}；原始响应开头: {head:?}")
+            })?;
+        let mut names = Vec::new();
+        collect_config_names(&v, &mut names);
+        names.sort();
+        names.dedup();
+        // 过滤明显非模型的值
+        names.retain(|n| {
+            !n.is_empty()
+                && !n.starts_with("http")
+                && n.len() < 64
+        });
+        Ok(names)
+    }
+}
+
+/// 递归收集 JSON 中所有 `config_name` 字符串值（防御性解析，容忍结构漂移）。
+fn collect_config_names(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(m) => {
+            if let Some(Value::String(s)) = m.get("config_name") {
+                if !s.is_empty() {
+                    out.push(s.clone());
+                }
+            }
+            for val in m.values() {
+                collect_config_names(val, out);
+            }
+        }
+        Value::Array(items) => {
+            for i in items {
+                collect_config_names(i, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[async_trait::async_trait]
@@ -118,6 +202,25 @@ impl Upstream for TraeUpstream {
 
     async fn models(&self) -> Vec<String> {
         DEFAULT_MODELS.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 模型同步：尝试从 Trae 模型网关拉取真实目录（batch_get_detail_param），
+    /// 失败或为空则回退内置列表。
+    async fn sync_models(&self) -> Vec<String> {
+        match self.fetch_remote_models().await {
+            Ok(list) if !list.is_empty() => {
+                crate::config::log(&format!(
+                    "🔄 Trae 远程模型同步成功：{} 个模型",
+                    list.len()
+                ));
+                list
+            }
+            Err(e) => {
+                crate::config::log(&format!("⚠️ Trae 远程模型同步失败，回退内置列表: {e}"));
+                self.models().await
+            }
+            Ok(_) => self.models().await,
+        }
     }
 
     async fn health_info(&self) -> Value {
