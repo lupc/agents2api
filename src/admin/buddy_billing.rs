@@ -310,7 +310,7 @@ fn walk_capable_dicts<'a>(v: &'a Value, depth: usize, out: &mut Vec<&'a Value>) 
     }
 }
 
-fn to_ts(v: Option<&Value>) -> Option<i64> {
+pub(crate) fn to_ts(v: Option<&Value>) -> Option<i64> {
     let v = v?;
     match v {
         Value::Number(n) => {
@@ -336,10 +336,15 @@ fn to_ts(v: Option<&Value>) -> Option<i64> {
     }
 }
 
-fn fmt_ts(ts: i64) -> String {
+pub(crate) fn fmt_ts(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
         .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
         .unwrap_or_else(|| ts.to_string())
+}
+
+/// unix 秒 → 本地日期串（供 trae 积分包复用）。
+pub(crate) fn fmt_ts_local(ts: i64) -> Option<String> {
+    Some(fmt_ts(ts))
 }
 
 /// 容量条目 → 积分包明细（对齐参考实现 packages_from 字段链）。
@@ -381,7 +386,7 @@ fn packages_from(body: &Value) -> Vec<Value> {
             ],
         );
         let end_ts = to_ts(end_raw);
-        let used = num_or_none(dig(item, &["UsedCapacity", "used", "Used"]));
+        let used = num_or_none(dig(item, &["CycleUsedCapacity", "UsedCapacity", "used", "Used"]));
         out.push(json!({
             "name": name,
             "code": code,

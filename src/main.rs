@@ -87,11 +87,31 @@ struct Cli {
     /// 关闭管理后台（/admin/*）
     #[arg(long, default_value_t = false)]
     no_admin: bool,
+    /// 只输出到控制台，不写文件日志（默认写「程序目录/logs」）
+    #[arg(long, default_value_t = false)]
+    no_log: bool,
+}
+
+/// 默认日志目录：程序目录下的 logs/；不可写（如安装到只读位置）时回退数据目录。
+fn program_logs_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("logs");
+            if std::fs::create_dir_all(&candidate).is_ok() {
+                // 验证可写
+                let probe = candidate.join(".write-test");
+                if std::fs::write(&probe, b"ok").is_ok() {
+                    let _ = std::fs::remove_file(&probe);
+                    return candidate;
+                }
+            }
+        }
+    }
+    data_dir.join("logs")
 }
 
 /// 从 CLI 提取重建注册表所需的基础设置。
-fn base_settings(cli: &Cli) -> admin::config_store::BaseSettings {
-    admin::config_store::BaseSettings {
+fn base_settings(cli: &Cli) -> admin::config_store::BaseSettings {    admin::config_store::BaseSettings {
         codebuddy_backend: cli.codebuddy_backend.clone(),
         trae_chat_host: cli.trae_chat_host.clone(),
         trae_storage_json: cli.trae_storage_json.clone(),
@@ -149,22 +169,34 @@ fn preflight(state: &AppState) {
 async fn main() {
     let cli = Cli::parse();
 
-    // --log（单文件）优先于 --log-dir（滚动）；都未给出则只输出控制台
-    let log_target = if let Some(p) = cli.log.clone() {
-        config::LogTarget::Single(std::path::PathBuf::from(p))
-    } else if let Some(d) = cli.log_dir.clone() {
-        config::LogTarget::RotatingDir(std::path::PathBuf::from(d))
-    } else {
-        config::LogTarget::None
-    };
-    config::init_logger(log_target);
-
     let base = base_settings(&cli);
     let data_dir = cli
         .data_dir
         .clone()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(admin::default_data_dir);
+
+    // 日志：--log（单文件）优先；其余情况默认开启目录滚动模式，
+    // 位置 = 程序目录/logs（不可写则回退数据目录/logs），--log-dir 可覆盖位置
+    let resolved_log_dir = cli
+        .log_dir
+        .clone()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| program_logs_dir(&data_dir));
+    let log_target = if cli.no_log {
+        config::LogTarget::None
+    } else if let Some(p) = cli.log.clone() {
+        config::LogTarget::Single(std::path::PathBuf::from(p))
+    } else {
+        config::LogTarget::RotatingDir(resolved_log_dir.clone())
+    };
+    config::init_logger(log_target);
+    let log_dir_active = if cli.no_log {
+        None
+    } else {
+        Some(resolved_log_dir.clone())
+    };
+
     let metrics = Arc::new(admin::MetricsStore::load(&data_dir));
     // 启动即合并文件覆盖项（<data_dir>/upstreams.json），CLI 默认上游仅作文件缺省兜底
     let mut cfg = admin::config_store::UpstreamsConfig::load(&data_dir);
@@ -187,7 +219,7 @@ async fn main() {
         metrics: metrics.clone(),
         data_dir: data_dir.clone(),
         admin_enabled: !cli.no_admin,
-        log_dir: cli.log_dir.clone().map(std::path::PathBuf::from),
+        log_dir: log_dir_active.clone(),
     });
 
     // 统计周期落盘（2s 节流在 MetricsStore 内部）
@@ -251,12 +283,14 @@ async fn main() {
         "✅ 监听 http://{}:{}（默认上游：{}）",
         cli.host, cli.port, cli.upstream
     ));
-    if let Some(p) = &cli.log {
+    if cli.no_log {
+        config::log("   文件日志  : 已关闭（仅控制台）");
+    } else if let Some(p) = &cli.log {
         config::log(&format!("   日志文件  : {p}"));
-    }
-    if let Some(d) = &cli.log_dir {
+    } else {
         config::log(&format!(
-            "   日志目录  : {d}/<日期>/converter-NNN.log（单文件 100MB 滚动）"
+            "   日志目录  : {}/<日期>/converter-NNN.log（单文件 100MB 滚动）",
+            resolved_log_dir.display()
         ));
     }
     config::log("   GET  /v1/models");

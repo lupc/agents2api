@@ -226,8 +226,9 @@ agents2api.exe --disable-upstream codebuddy
 |------|------|
 | `--host` / `--port` | 监听地址与端口（默认 `127.0.0.1:8787`） |
 | `--api-key` | 可选：要求客户端携带的 API key |
-| `--log PATH` | 开启文件日志（请求 / 响应 / 投影统计 / 原始 SSE），单文件追加、不滚动 |
-| `--log-dir DIR` | 按日期分目录的滚动日志：`DIR/<日期>/converter-NNN.log`，单文件上限 100MB 超限自动滚动；与 `--log` 同时给出时 `--log` 优先 |
+| `--log PATH` | 单文件日志（追加、不滚动）。不给则默认「目录滚动」模式 |
+| `--log-dir DIR` | 覆盖滚动日志目录（默认「程序目录/logs」，不可写时回退数据目录/logs） |
+| `--no-log` | 只输出控制台，不写文件日志 |
 | `--upstream NAME` | 无前缀时使用的默认上游（`codebuddy` / `trae`） |
 | `--disable-upstream NAME` | 禁用某上游（可重复） |
 | `--desensitize` / `--no-compact` | 零宽脱敏（+ 是否压缩 harness） |

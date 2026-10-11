@@ -124,12 +124,18 @@ pub async fn fetch(st: &AdminState) -> Result<Value, String> {
                             .pointer("/usage/credits_amount")
                             .and_then(|v| v.as_f64())
                             .unwrap_or(0.0);
+                        // 过期时间：unix 秒 → 本地日期串（前端读 end_time）
+                        let end_ts = p
+                            .pointer("/entitlement_base_info/end_time")
+                            .and_then(|v| v.as_i64());
+                        let end_time = end_ts
+                            .and_then(crate::admin::buddy_billing::fmt_ts_local);
                         json!({
                             "name": p.get("display_desc").cloned().unwrap_or(Value::Null),
                             "granted": granted,
                             "remaining": (granted - used).max(0.0),
                             "used": used,
-                            "expire_time": p.pointer("/entitlement_base_info/end_time").cloned().unwrap_or(Value::Null),
+                            "end_time": end_time.unwrap_or_else(|| "—".to_string()),
                         })
                     })
                     .collect()
