@@ -182,10 +182,42 @@ pub async fn all_models(State(st): State<AdminState>) -> Response {
             "models": up.models().await,
         }));
     }
-    let snapshot: Option<Value> = std::fs::read_to_string(catalog_snapshot_path(&st.data_dir))
+    let mut snapshot: Option<Value> = std::fs::read_to_string(catalog_snapshot_path(&st.data_dir))
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok());
+    // 旧命名迁移：快照里的 codebuddy / workbuddy 键合并为 buddy
+    if let Some(snap) = &mut snapshot {
+        if let Some(by) = snap.get_mut("by_upstream") {
+            migrate_snapshot_keys(by);
+        }
+    }
     Json(json!({"by_upstream": by_upstream, "snapshot": snapshot})).into_response()
+}
+
+/// 目录快照旧命名迁移：by_upstream 里的 codebuddy / workbuddy 键合并为 buddy
+/// （二者原是同一上游的两个别名，取有 models 的那个；buddy 已存在则优先 buddy）。
+/// 原地修改。
+fn migrate_snapshot_keys(by_upstream: &mut Value) {
+    let Some(obj) = by_upstream.as_object_mut() else { return };
+    let mut legacy_entry: Option<Value> = None;
+    for old in ["codebuddy", "workbuddy"] {
+        if let Some(e) = obj.remove(old) {
+            // 优先取有 models 的条目
+            let has_models = e
+                .get("models")
+                .and_then(|m| m.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            legacy_entry = match legacy_entry.take() {
+                Some(prev) if !has_models => Some(prev),
+                _ => Some(e),
+            };
+        }
+    }
+    if let Some(e) = legacy_entry {
+        obj.entry("buddy".to_string())
+            .or_insert(e);
+    }
 }
 
 /// 同步核心逻辑（HTTP 处理器与每日定时任务共用）。
