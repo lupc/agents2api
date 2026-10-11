@@ -2,6 +2,7 @@ target/
 *.log
 converter.log
 .zcode/
+.zcodeignore
 /dist/
 /data/
 *.exe
