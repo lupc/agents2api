@@ -3,6 +3,7 @@
 //! 挂在 `/admin/*` 下，与 `/v1/*` 完全隔离：
 
 pub mod assets;
+pub mod buddy_billing;
 pub mod checkin;
 pub mod config_store;
 pub mod credits;
@@ -67,8 +68,10 @@ pub fn router(state: AdminState) -> Router<SharedState> {
             get(routes::get_settings).put(routes::put_settings),
         )
         .route("/api/checkin/trae", post(routes::checkin_trae))
+        .route("/api/checkin/buddy", post(routes::checkin_buddy))
         .route("/api/checkin/results", get(routes::checkin_results))
         .route("/api/credits/trae", get(routes::credits_trae))
+        .route("/api/credits/buddy", get(routes::credits_buddy))
         .route("/api/logs", get(routes::logs_tail))
         // SPA：其余 /admin/* 路径回前端入口
         .fallback(get(assets::spa_fallback))

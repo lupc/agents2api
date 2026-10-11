@@ -378,9 +378,9 @@ pub async fn put_settings(State(st): State<AdminState>, Json(body): Json<Value>)
     Json(s).into_response()
 }
 
-// ---- Phase 3：Trae 签到 / 积分 ----
+// ---- 签到 / 积分（trae + buddy）----
 
-/// `POST /admin/api/checkin/trae` — 一键签到。
+/// `POST /admin/api/checkin/trae` — Trae 一键签到。
 pub async fn checkin_trae(State(st): State<AdminState>) -> Response {
     match super::checkin::run_checkin(&st).await {
         Ok(v) => Json(v).into_response(),
@@ -392,17 +392,56 @@ pub async fn checkin_trae(State(st): State<AdminState>) -> Response {
     }
 }
 
-/// `GET /admin/api/checkin/results?days=30`
+/// `POST /admin/api/checkin/buddy` — Buddy 一键签到。
+pub async fn checkin_buddy(State(st): State<AdminState>) -> Response {
+    match super::buddy_billing::run_checkin(&st).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": {"message": e}})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /admin/api/checkin/results?days=30&upstream=trae`
+#[derive(Deserialize)]
+pub struct ResultsQuery {
+    #[serde(default = "default_days")]
+    pub days: usize,
+    #[serde(default = "default_results_upstream")]
+    pub upstream: String,
+}
+
+fn default_results_upstream() -> String {
+    "trae".to_string()
+}
+
 pub async fn checkin_results(
     State(st): State<AdminState>,
-    Query(q): Query<DaysQuery>,
+    Query(q): Query<ResultsQuery>,
 ) -> Response {
-    Json(super::checkin::results(&st, q.days.clamp(1, 365))).into_response()
+    Json(
+        super::checkin::results(&st, q.days.clamp(1, 365), &q.upstream),
+    )
+    .into_response()
 }
 
 /// `GET /admin/api/credits/trae`
 pub async fn credits_trae(State(st): State<AdminState>) -> Response {
     match super::credits::fetch(&st).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": {"message": e}})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /admin/api/credits/buddy`
+pub async fn credits_buddy(State(st): State<AdminState>) -> Response {
+    match super::buddy_billing::fetch_credits(&st).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,

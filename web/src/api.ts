@@ -75,13 +75,15 @@ export interface CheckinRecord {
 }
 
 export interface CreditsInfo {
+  upstream?: string
+  source?: string
   uid: string
   token_expired: boolean
   total_credits?: number
   consumed_credits?: number
   remaining_credits?: number
   consumption_ratio?: number
-  packs?: { name: string | null; expire_time: number | null }[]
+  packs?: { name: string | null; code?: string | null; remaining?: number; total?: number; used?: number; end_time?: string | null; expire_time?: number | null }[]
   ent_usage_error?: string
   checkin_status_error?: string
 }
@@ -113,9 +115,9 @@ export const api = {
   putSettings: (s: AdminSettings) => client.put('/settings', s).then(r => r.data),
   models: () => client.get<{ by_upstream: { upstream: string; models: string[] }[]; snapshot?: { synced_at: string; by_upstream: Record<string, { count?: number; models?: ModelInfo[]; error?: string | null }> } }>('/models').then(r => r.data),
   sync: () => client.post<{ ok: boolean; synced_at: string; by_upstream: Record<string, { count?: number; models?: ModelInfo[]; error?: string | null }> }>('/sync').then(r => r.data),
-  checkin: () => client.post<{ ok: boolean; result: CheckinRecord }>('/checkin/trae').then(r => r.data),
-  checkinResults: (days = 30) => client.get<{ records: CheckinRecord[]; trend: { date: string; ok: number; already: number; failed: number }[] }>('/checkin/results', { params: { days } }).then(r => r.data),
-  credits: () => client.get<CreditsInfo>('/credits/trae').then(r => r.data),
+  checkin: (upstream: 'trae' | 'buddy') => client.post<{ ok: boolean; result: CheckinRecord }>(`/checkin/${upstream}`).then(r => r.data),
+  checkinResults: (days = 30, upstream: 'trae' | 'buddy' = 'trae') => client.get<{ records: CheckinRecord[]; trend: { date: string; ok: number; already: number; failed: number }[] }>('/checkin/results', { params: { days, upstream } }).then(r => r.data),
+  credits: (upstream: 'trae' | 'buddy') => client.get<CreditsInfo>(`/credits/${upstream}`).then(r => r.data),
   logs: (lines = 200) => client.get<{ lines: string[]; file: string | null }>('/logs', { params: { lines } }).then(r => r.data),
 }
 

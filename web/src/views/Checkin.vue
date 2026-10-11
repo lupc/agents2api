@@ -1,13 +1,17 @@
 <template>
   <div>
-    <h2 class="page-title">一键签到（Trae）</h2>
+    <h2 class="page-title">一键签到</h2>
     <el-card shadow="never">
-      <div style="display: flex; align-items: center; gap: 16px">
-        <el-button type="primary" size="large" :loading="checking" @click="doCheckin">
+      <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap">
+        <el-radio-group v-model="upstream">
+          <el-radio-button value="trae">Trae</el-radio-button>
+          <el-radio-button value="buddy">Buddy</el-radio-button>
+        </el-radio-group>
+        <el-button type="primary" :loading="checking" @click="doCheckin">
           立即签到
         </el-button>
         <span v-if="lastResult" :class="statusClass(lastResult.status)">
-          上次结果：{{ statusText(lastResult.status) }} · {{ lastResult.message }}
+          {{ statusText(lastResult.status) }} · {{ lastResult.message }}
           <template v-if="lastResult.delta > 0">（+{{ lastResult.delta }} 积分）</template>
         </span>
       </div>
@@ -16,7 +20,7 @@
     <el-row :gutter="16" style="margin-top: 16px">
       <el-col :span="14">
         <el-card shadow="never">
-          <template #header>签到趋势（近 {{ days }} 天）</template>
+          <template #header>签到趋势（{{ upstream }} · 近 {{ days }} 天）</template>
           <el-table :data="trend" size="small" stripe>
             <el-table-column prop="date" label="日期" width="120" />
             <el-table-column prop="ok" label="成功" width="80" />
@@ -46,10 +50,11 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api, type CheckinRecord } from '../api'
 
+const upstream = ref<'trae' | 'buddy'>('trae')
 const checking = ref(false)
 const lastResult = ref<CheckinRecord | null>(null)
 const records = ref<CheckinRecord[]>([])
@@ -67,16 +72,17 @@ function statusClass(s: string) {
 }
 
 async function load() {
-  const d = await api.checkinResults(days.value)
+  const d = await api.checkinResults(days.value, upstream.value)
   records.value = d.records
   trend.value = d.trend
   if (d.records.length) lastResult.value = d.records[0]
+  else lastResult.value = null
 }
 
 async function doCheckin() {
   checking.value = true
   try {
-    const r = await api.checkin()
+    const r = await api.checkin(upstream.value)
     lastResult.value = r.result
     if (r.result.status === 'success') ElMessage.success('签到成功')
     else if (r.result.status === 'already') ElMessage.info('今日已签到')
@@ -90,6 +96,7 @@ async function doCheckin() {
 }
 
 onMounted(load)
+watch(upstream, load)
 </script>
 
 <style scoped>

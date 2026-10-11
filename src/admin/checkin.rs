@@ -29,6 +29,13 @@ pub struct CheckinRecord {
     pub credits: f64,
     #[serde(default)]
     pub delta: f64,
+    /// 所属上游（旧记录无此字段时视为 trae）
+    #[serde(default = "default_record_upstream")]
+    pub upstream: String,
+}
+
+fn default_record_upstream() -> String {
+    "trae".to_string()
 }
 
 /// 签到用请求头（与 chat 不同：Cloud-IDE-JWT 前缀 + VSCode UA）。
@@ -117,6 +124,7 @@ pub async fn checkin_one(info: &TraeAuthInfo) -> CheckinRecord {
         message: String::new(),
         credits: 0.0,
         delta: 0.0,
+        upstream: "trae".to_string(),
     };
 
     let client = reqwest::Client::new();
@@ -266,8 +274,8 @@ pub async fn run_checkin(st: &super::AdminState) -> Result<Value, String> {
     }))
 }
 
-/// 签到记录与按日趋势。
-pub fn results(st: &super::AdminState, days: usize) -> Value {
+/// 签到记录与按日趋势（按上游过滤；旧记录无 upstream 字段视为 trae）。
+pub fn results(st: &super::AdminState, days: usize, upstream: &str) -> Value {
     let path = st.data_dir.join("checkin.json");
     let records: Vec<CheckinRecord> = std::fs::read_to_string(&path)
         .ok()
@@ -276,8 +284,12 @@ pub fn results(st: &super::AdminState, days: usize) -> Value {
     let cutoff = (chrono::Local::now() - chrono::Duration::days(days as i64 - 1))
         .format("%Y-%m-%d")
         .to_string();
-    let recent: Vec<CheckinRecord> =
-        records.into_iter().filter(|r| r.date >= cutoff).collect();
+    let recent: Vec<CheckinRecord> = records
+        .into_iter()
+        .filter(|r| r.date >= cutoff)
+        .filter(|r| r.upstream.as_str() == upstream
+            || (upstream == "trae" && r.upstream.is_empty()))
+        .collect();
     // 按日聚合趋势
     let mut trend: std::collections::BTreeMap<String, (u64, u64, u64)> =
         std::collections::BTreeMap::new();
