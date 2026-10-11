@@ -68,14 +68,14 @@
         <template #header>积分包明细</template>
         <el-table :data="packs" size="small" stripe>
           <el-table-column prop="name" label="来源" min-width="160" />
+          <el-table-column label="获得积分" width="110">
+            <template #default="{ row }">{{ fmtNum(row.granted) }}</template>
+          </el-table-column>
           <el-table-column label="剩余" width="110">
             <template #default="{ row }">{{ fmtNum(row.remaining) }}</template>
           </el-table-column>
-          <el-table-column label="总额" width="110">
-            <template #default="{ row }">{{ row.total ? fmtNum(row.total) : '—' }}</template>
-          </el-table-column>
           <el-table-column label="已用" width="110">
-            <template #default="{ row }">{{ row.used ? fmtNum(row.used) : '—' }}</template>
+            <template #default="{ row }">{{ fmtNum(row.used) }}</template>
           </el-table-column>
           <el-table-column label="过期时间" width="140">
             <template #default="{ row }">{{ row.end_time || '—' }}</template>

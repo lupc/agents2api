@@ -77,3 +77,5 @@ pub fn router(state: AdminState) -> Router<SharedState> {
         .fallback(get(assets::spa_fallback))
         .with_state(state)
 }
+
+

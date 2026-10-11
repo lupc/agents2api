@@ -385,6 +385,7 @@ fn packages_from(body: &Value) -> Vec<Value> {
         out.push(json!({
             "name": name,
             "code": code,
+            "granted": total.unwrap_or(0.0),
             "remaining": remaining.unwrap_or(0.0),
             "total": total.unwrap_or(0.0),
             "used": used.unwrap_or(0.0),

@@ -108,15 +108,27 @@ pub async fn fetch(st: &AdminState) -> Result<Value, String> {
             .and_then(|u| u.get("consumption_ratio"))
             .cloned()
             .unwrap_or(Value::Null);
-        // 积分包明细（名称 + 过期时间）
+        // 积分明细：获得 = quota.credits_limit；已用 = usage.credits_amount；
+        // 剩余 = 获得 - 已用（实测字段链：entitlement_base_info.quota.credits_limit）
         let packs: Vec<Value> = v
             .pointer("/user_entitlement_pack_list")
             .and_then(|p| p.as_array())
             .map(|arr| {
                 arr.iter()
                     .map(|p| {
+                        let granted = p
+                            .pointer("/entitlement_base_info/quota/credits_limit")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let used = p
+                            .pointer("/usage/credits_amount")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
                         json!({
                             "name": p.get("display_desc").cloned().unwrap_or(Value::Null),
+                            "granted": granted,
+                            "remaining": (granted - used).max(0.0),
+                            "used": used,
                             "expire_time": p.pointer("/entitlement_base_info/end_time").cloned().unwrap_or(Value::Null),
                         })
                     })
