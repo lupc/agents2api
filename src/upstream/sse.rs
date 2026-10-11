@@ -161,6 +161,30 @@ impl ChatAggregator {
     }
 }
 
+/// 从 usage 里取「缓存命中的输入 tokens」，字段名按候选链兜底。
+///
+/// 各上游口径不同：OpenAI 系用 `prompt_tokens_details.cached_tokens`，
+/// Anthropic / Buddy 系用 `cache_read_input_tokens` 或 `prompt_cache_hit_tokens`。
+/// 全部缺失或为 0 时返回 0（表示「未报告」与「未命中」不可区分，按未命中处理）。
+fn cached_tokens_of(usage: &serde_json::Value) -> u64 {
+    const CANDIDATES: &[&str] = &[
+        "prompt_cache_hit_tokens",
+        "cache_read_input_tokens",
+        "cached_tokens",
+    ];
+    let mut best = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    for k in CANDIDATES {
+        if let Some(v) = usage.get(*k).and_then(|v| v.as_u64()) {
+            best = best.max(v);
+        }
+    }
+    best
+}
+
 /// 流式转发时轻量解析统计（finish_reason / tool_calls / usage / 审核拦截）。
 #[derive(Default)]
 pub struct StreamStats {
@@ -169,8 +193,15 @@ pub struct StreamStats {
     pub usage_total: Option<i64>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// 输入中命中上游缓存的 tokens（0 = 上游未报告或未命中）。
+    pub cached_tokens: u64,
     pub saw_filter: bool,
     pub buf: Vec<u8>,
+    /// 是否已观察到首个内容增量（首个 token 已到达）。
+    ///
+    /// 用于测量 TTFT：请求发出到第一个 token 返回的耗时。只认「有内容」的
+    /// chunk（role / 空 delta 等心跳帧不算），否则 TTFT 会被系统性低估。
+    pub saw_token: bool,
 }
 
 impl StreamStats {
@@ -212,6 +243,11 @@ impl StreamStats {
             {
                 self.completion_tokens = c;
             }
+            // 命中缓存的输入 tokens：用于区分「真实预填充」与「缓存命中」。
+            // 各上游字段名不统一（OpenAI 用 prompt_tokens_details.cached_tokens，
+            // Anthropic / Buddy 用 cache_read_input_tokens、prompt_cache_hit_tokens），
+            // 故按候选链依次兜底，取第一个 >0 的值。
+            self.cached_tokens = cached_tokens_of(usage);
         }
         if let Some(choices) = obj.get("choices").and_then(|c| c.as_array()) {
             for ch in choices {
@@ -219,6 +255,27 @@ impl StreamStats {
                     if !f.is_empty() {
                         self.finish_reason = Some(f.to_string());
                     }
+                }
+                // 首个内容增量即视为首 token 到达（content / reasoning / tool_calls 任一）
+                let delta = ch.get("delta").unwrap_or(&serde_json::Value::Null);
+                let has_content = delta
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+                let has_reasoning = delta
+                    .get("reasoning")
+                    .or_else(|| delta.get("reasoning_content"))
+                    .and_then(|c| c.as_str())
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+                let has_tool = delta
+                    .get("tool_calls")
+                    .and_then(|t| t.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false);
+                if has_content || has_reasoning || has_tool {
+                    self.saw_token = true;
                 }
                 if let Some(tcs) = ch
                     .pointer("/delta/tool_calls")
@@ -240,6 +297,38 @@ impl StreamStats {
         if line.contains("content-filter") || line.contains("敏感") || line.contains("审核") {
             self.saw_filter = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 各上游的缓存字段命名不统一，需按候选链兜底取到值。
+    #[test]
+    fn test_cached_tokens_field_fallbacks() {
+        // OpenAI 系
+        assert_eq!(cached_tokens_of(&json!({"prompt_tokens_details": {"cached_tokens": 80}})), 80);
+        // Anthropic / Buddy 系
+        assert_eq!(cached_tokens_of(&json!({"cache_read_input_tokens": 64})), 64);
+        assert_eq!(cached_tokens_of(&json!({"prompt_cache_hit_tokens": 32})), 32);
+        assert_eq!(cached_tokens_of(&json!({"cached_tokens": 16})), 16);
+        // 缺失 / 为 0 → 0
+        assert_eq!(cached_tokens_of(&json!({"prompt_tokens": 100})), 0);
+        assert_eq!(cached_tokens_of(&json!({"prompt_cache_hit_tokens": 0})), 0);
+    }
+
+    /// 真实上游载荷：命中缓存时 StreamStats 必须拿到 cached_tokens，
+    /// 否则预填充速度不会扣除缓存、虚高。
+    #[test]
+    fn test_stream_stats_reads_cache_from_usage() {
+        let mut s = StreamStats::new();
+        s.feed(
+            br#"data: {"choices":[{"delta":{"content":"hi"}}],"usage":{"prompt_tokens":1000,"completion_tokens":50,"cache_read_input_tokens":900}}
+"#,
+        );
+        assert_eq!(s.prompt_tokens, 1000);
+        assert_eq!(s.cached_tokens, 900);
     }
 }
 
