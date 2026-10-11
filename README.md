@@ -62,6 +62,36 @@ pub trait Upstream: Send + Sync {
 
 以上端点在 `/{upstream}` 前缀下同样可用。
 
+## 管理后台（Web UI）
+
+访问 `http://127.0.0.1:8787/admin/`（Vue3 + ElementPlus 单页应用，构建后内嵌进二进制，无需额外服务）。
+
+| 页面 | 功能 |
+|------|------|
+| 汇总统计 | 请求数/成功率/Tokens/P95 耗时卡片、请求趋势图、模型速率榜（P50/P95/TTFT）、按天用量表 |
+| 上游配置 | 各上游启用开关、codebuddy 后端地址与 trae chat host 覆盖、默认上游切换，保存即热重载 |
+| 模型同步 | 各上游模型目录一览，一键同步（Trae 从模型网关拉真实目录，失败回退内置列表） |
+| 一键签到 | Trae 每日签到，逐次结果与按日趋势（CodeBuddy/WorkBuddy 暂不支持，接口已预留） |
+| 积分看板 | Trae 剩余/总额/已消耗积分、积分包明细与过期时间 |
+| 日志 | 查看滚动日志最新文件的尾部（`--log-dir` 启用时） |
+
+对应 WebAPI（`/admin/api/*`）：`overview`、`stats/usage`、`stats/models`、`upstreams`、`upstreams/reload`、`config`(GET/PUT)、`models`、`sync`、`checkin/trae`、`checkin/results`、`credits/trae`、`logs`、`health`。
+
+- 统计数据落在 `<data_dir>/stats.json`（按天聚合，保留 90 天，内存权威 + 2s 周期落盘）
+- 上游配置落在 `<data_dir>/upstreams.json`（文件值覆盖 CLI/env）
+- 数据目录默认 `%APPDATA%agents2api`（Windows），可用 `--data-dir` 改；`--no-admin` 关闭后台
+
+### 前端开发
+
+```bash
+cd web
+npm install
+npm run dev        # 开发模式：/admin 代理到 127.0.0.1:8787，改前端刷新即可
+npm run build      # 产出 web/dist，cargo build 时由 rust-embed 内嵌
+```
+
+仓库已包含构建好的 `web/dist`，纯后端改动无需重新构建前端。
+
 ## 构建
 
 ### 环境要求
@@ -104,7 +134,7 @@ target\release\agents2api.exe --help
 ### 运行测试
 
 ```bash
-cargo test                       # 全部 99 个用例
+cargo test                       # 全部 111 个用例
 cargo test trae                  # 只跑 Trae 相关
 cargo test -- --nocapture        # 显示输出
 ```
@@ -202,6 +232,8 @@ agents2api.exe --disable-upstream codebuddy
 | `--disable-upstream NAME` | 禁用某上游（可重复） |
 | `--desensitize` / `--no-compact` | 零宽脱敏（+ 是否压缩 harness） |
 | `--skip-check` | 跳过启动预检 |
+| `--data-dir DIR` | 数据目录（统计/签到/后台配置），默认 %APPDATA%agents2api |
+| `--no-admin` | 关闭管理后台 |
 | `--codebuddy-backend URL` | 覆盖 CodeBuddy 后端地址 |
 | `--trae-chat-host URL` | 覆盖 Trae chat host |
 | `--trae-storage-json PATH` | 显式指定 Trae storage.json |
@@ -214,6 +246,7 @@ agents2api.exe --disable-upstream codebuddy
 | `CODEBUDDY_AUTH_DIR` | CodeBuddy 登录态目录 |
 | `CODEBUDDY2OPENAI_KEY` / `CODEBUDDY2OPENAI_LOG` | 等价 `--api-key` / `--log` |
 | `CODEBUDDY2OPENAI_LOG_DIR` | 等价 `--log-dir` |
+| `AGENTS2API_DATA_DIR` | 等价 `--data-dir` |
 | `WORKBUDDY_AT_REST_SECRET` / `WORKBUDDY_ELECTRON_PATH` | WorkBuddy at-rest 密钥 |
 | `TRAE_STORAGE_JSON` | Trae storage.json 路径 |
 | `TRAE_CHAT_HOST` | Trae 上游 host |
@@ -309,7 +342,7 @@ Trae 上游是**逆向实现的私有协议**（参考 [smart-open/TraeWorkAssis
 ## 测试
 
 ```bash
-cargo test            # 全部 99 个用例
+cargo test            # 全部 111 个用例
 cargo test trae       # 只跑 Trae 相关
 ```
 
