@@ -104,7 +104,7 @@ target\release\codebuddy2api.exe --help
 ### 运行测试
 
 ```bash
-cargo test                       # 全部 89 个用例
+cargo test                       # 全部 99 个用例
 cargo test trae                  # 只跑 Trae 相关
 cargo test -- --nocapture        # 显示输出
 ```
@@ -196,7 +196,8 @@ codebuddy2api.exe --disable-upstream codebuddy
 |------|------|
 | `--host` / `--port` | 监听地址与端口（默认 `127.0.0.1:8787`） |
 | `--api-key` | 可选：要求客户端携带的 API key |
-| `--log PATH` | 开启文件日志（请求 / 响应 / 投影统计 / 原始 SSE） |
+| `--log PATH` | 开启文件日志（请求 / 响应 / 投影统计 / 原始 SSE），单文件追加、不滚动 |
+| `--log-dir DIR` | 按日期分目录的滚动日志：`DIR/<日期>/converter-NNN.log`，单文件上限 100MB 超限自动滚动；与 `--log` 同时给出时 `--log` 优先 |
 | `--upstream NAME` | 无前缀时使用的默认上游（`codebuddy` / `trae`） |
 | `--disable-upstream NAME` | 禁用某上游（可重复） |
 | `--desensitize` / `--no-compact` | 零宽脱敏（+ 是否压缩 harness） |
@@ -212,6 +213,7 @@ codebuddy2api.exe --disable-upstream codebuddy
 |------|------|
 | `CODEBUDDY_AUTH_DIR` | CodeBuddy 登录态目录 |
 | `CODEBUDDY2OPENAI_KEY` / `CODEBUDDY2OPENAI_LOG` | 等价 `--api-key` / `--log` |
+| `CODEBUDDY2OPENAI_LOG_DIR` | 等价 `--log-dir` |
 | `WORKBUDDY_AT_REST_SECRET` / `WORKBUDDY_ELECTRON_PATH` | WorkBuddy at-rest 密钥 |
 | `TRAE_STORAGE_JSON` | Trae storage.json 路径 |
 | `TRAE_CHAT_HOST` | Trae 上游 host |
@@ -220,6 +222,32 @@ codebuddy2api.exe --disable-upstream codebuddy
 | `OPENCODE_AUTH_JSON` | OpenCode auth.json 路径（不设则自动探测） |
 | `CODEBUDDY_LOSSY_PROJECTION` | `1` = 启用 /v1/responses 有损投影 |
 | `CODEBUDDY_RESPONSES_DESENSITIZE` | `1` = /v1/responses 也脱敏 |
+
+### 日志
+
+两种文件日志方式，均同时输出到控制台（stderr）：
+
+```bash
+# 方式一：单文件追加（不滚动，适合短期调试）
+codebuddy2api.exe --log converter.log
+
+# 方式二：按日期分目录 + 滚动（推荐长期运行）
+codebuddy2api.exe --log-dir logs
+```
+
+`--log-dir` 的产出结构：
+
+```
+logs/
+└── 2026-10-11/
+    ├── converter-001.log   ← 单文件上限 100MB，写满滚动为 -002
+    └── converter-002.log
+```
+
+- 重启进程会续写当天最新的文件（不覆盖历史）
+- 跨天自动切换到新日期目录
+- 每条日志带时间戳与请求 id（`[rid]`），含请求/响应体、上游 wire body、原始 SSE，
+  便于排查上游协议问题
 
 ## 登录态位置
 
@@ -281,7 +309,7 @@ Trae 上游是**逆向实现的私有协议**（参考 [smart-open/TraeWorkAssis
 ## 测试
 
 ```bash
-cargo test            # 全部 89 个用例
+cargo test            # 全部 99 个用例
 cargo test trae       # 只跑 Trae 相关
 ```
 

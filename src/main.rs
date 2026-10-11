@@ -53,6 +53,10 @@ struct Cli {
     /// 开启日志并写到该文件；不传则回退读 CODEBUDDY2OPENAI_LOG
     #[arg(long, env = "CODEBUDDY2OPENAI_LOG")]
     log: Option<String>,
+    /// 按日期分目录的滚动日志根目录（DIR/<日期>/converter-NNN.log，
+    /// 单文件上限 100MB，超过自动滚动）；与 --log 同时给出时 --log 优先
+    #[arg(long, env = "CODEBUDDY2OPENAI_LOG_DIR")]
+    log_dir: Option<String>,
     /// 启用脱敏：对 system 消息里的合规模板敏感词插入零宽空格
     #[arg(long, default_value_t = false)]
     desensitize: bool,
@@ -157,8 +161,15 @@ fn preflight(state: &AppState) {
 async fn main() {
     let cli = Cli::parse();
 
-    let log_path = cli.log.clone().map(std::path::PathBuf::from);
-    config::init_logger(log_path);
+    // --log（单文件）优先于 --log-dir（滚动）；都未给出则只输出控制台
+    let log_target = if let Some(p) = cli.log.clone() {
+        config::LogTarget::Single(std::path::PathBuf::from(p))
+    } else if let Some(d) = cli.log_dir.clone() {
+        config::LogTarget::RotatingDir(std::path::PathBuf::from(d))
+    } else {
+        config::LogTarget::None
+    };
+    config::init_logger(log_target);
 
     let upstreams = build_upstreams(&cli);
     let state: SharedState = Arc::new(AppState {
@@ -188,6 +199,11 @@ async fn main() {
     eprintln!("   POST /v1/messages           (Anthropic API，Claude Code / CC Switch 兼容)");
     eprintln!("   GET  /health");
     eprintln!("   多上游前缀：/<upstream>/v1/... 与 /<upstream>/health");
+    if let Some(d) = &cli.log_dir {
+        eprintln!(
+            "   日志目录  : {d}/<日期>/converter-NNN.log（单文件 100MB 滚动）"
+        );
+    }
     if !cli.api_key.is_empty() {
         eprintln!("   鉴权已启用（API key 已设置）");
     }
