@@ -10,58 +10,74 @@
     <el-skeleton v-if="loading" :rows="4" animated />
     <template v-if="info">
       <!-- Buddy：summary 数值 + 积分包明细 -->
-      <el-row v-if="upstream === 'buddy'" :gutter="16">
-        <el-col :span="8">
-          <el-card shadow="never">
-            <div class="stat-label">剩余积分</div>
-            <div class="stat-value primary">{{ fmtNum(info.remaining_credits) }}</div>
-            <div class="stat-sub" v-if="info.source">数据源：{{ info.source }}</div>
-          </el-card>
-        </el-col>
-        <el-col :span="8" v-if="info.total_credits != null">
-          <el-card shadow="never">
-            <div class="stat-label">总额度</div>
-            <div class="stat-value">{{ fmtNum(info.total_credits) }}</div>
-          </el-card>
-        </el-col>
-        <el-col :span="8">
-          <el-card shadow="never">
-            <div class="stat-label">账号</div>
-            <div class="stat-value-small">Buddy（CodeBuddy / WorkBuddy）</div>
-          </el-card>
-        </el-col>
-      </el-row>
+      <div class="stat-row" v-if="upstream === 'buddy'">
+        <el-card class="stat-card" shadow="never">
+          <div class="stat-label">剩余积分</div>
+          <div class="stat-value primary">{{ fmtNum(info.remaining_credits) }}</div>
+          <div class="stat-sub" v-if="info.source">数据源：{{ info.source }}</div>
+        </el-card>
+        <el-card class="stat-card" shadow="never" v-if="info.total_credits != null">
+          <div class="stat-label">总额度</div>
+          <div class="stat-value">{{ fmtNum(info.total_credits) }}</div>
+        </el-card>
+        <el-card class="stat-card" shadow="never">
+          <div class="stat-label">今日消耗</div>
+          <div class="stat-value">{{ fmtNum(info.today_consumed) }}</div>
+          <div class="stat-sub" v-if="info.today_consumed_error" :title="info.today_consumed_error">
+            获取失败
+          </div>
+        </el-card>
+        <el-card class="stat-card" shadow="never">
+          <div class="stat-label">7天内即将过期</div>
+          <div class="stat-value danger">{{ fmtNum(expiringSoon.sum) }}</div>
+          <div class="stat-sub">{{ expiringSoon.count }} 项</div>
+        </el-card>
+        <el-card class="stat-card" shadow="never">
+          <div class="stat-label">账号</div>
+          <div class="stat-value-small">{{ info.uid || '—' }}</div>
+          <div class="stat-sub">
+            <el-tag size="small" :type="info.token_expired ? 'danger' : 'success'">
+              {{ info.token_expired ? 'token 已过期' : 'token 有效' }}
+            </el-tag>
+          </div>
+        </el-card>
+      </div>
 
       <!-- Trae：summary 数值 -->
-      <el-row v-if="upstream === 'trae'" :gutter="16">
-        <el-col :span="8">
-          <el-card shadow="never">
-            <div class="stat-label">剩余积分</div>
-            <div class="stat-value primary">{{ fmtNum(info.remaining_credits) }}</div>
-            <div class="stat-sub" v-if="info.consumption_ratio != null">
-              已用 {{ ((info.consumption_ratio ?? 0) * 100).toFixed(1) }}%
-            </div>
-          </el-card>
-        </el-col>
-        <el-col :span="8" v-if="info.total_credits != null">
-          <el-card shadow="never">
-            <div class="stat-label">总额度</div>
-            <div class="stat-value">{{ fmtNum(info.total_credits) }}</div>
-            <div class="stat-sub">已消耗 {{ fmtNum(info.consumed_credits ?? 0) }}</div>
-          </el-card>
-        </el-col>
-        <el-col :span="8">
-          <el-card shadow="never">
-            <div class="stat-label">账号</div>
-            <div class="stat-value-small">{{ info.uid }}</div>
-            <div class="stat-sub">
-              <el-tag size="small" :type="info.token_expired ? 'danger' : 'success'">
-                {{ info.token_expired ? 'token 已过期' : 'token 有效' }}
-              </el-tag>
-            </div>
-          </el-card>
-        </el-col>
-      </el-row>
+      <div class="stat-row" v-if="upstream === 'trae'">
+        <el-card class="stat-card" shadow="never">
+          <div class="stat-label">剩余积分</div>
+          <div class="stat-value primary">{{ fmtNum(info.remaining_credits) }}</div>
+          <div class="stat-sub" v-if="info.consumption_ratio != null">
+            已用 {{ ((info.consumption_ratio ?? 0) * 100).toFixed(1) }}%
+          </div>
+        </el-card>
+        <el-card class="stat-card" shadow="never" v-if="info.total_credits != null">
+          <div class="stat-label">总额度</div>
+          <div class="stat-value">{{ fmtNum(info.total_credits) }}</div>
+        </el-card>
+        <el-card class="stat-card" shadow="never">
+          <div class="stat-label">今日消耗</div>
+          <div class="stat-value">{{ fmtNum(info.today_consumed) }}</div>
+          <div class="stat-sub" v-if="info.today_consumed_error" :title="info.today_consumed_error">
+            获取失败
+          </div>
+        </el-card>
+        <el-card class="stat-card" shadow="never">
+          <div class="stat-label">7天内即将过期</div>
+          <div class="stat-value danger">{{ fmtNum(expiringSoon.sum) }}</div>
+          <div class="stat-sub">{{ expiringSoon.count }} 项</div>
+        </el-card>
+        <el-card class="stat-card" shadow="never">
+          <div class="stat-label">账号</div>
+          <div class="stat-value-small">{{ info.uid }}</div>
+          <div class="stat-sub">
+            <el-tag size="small" :type="info.token_expired ? 'danger' : 'success'">
+              {{ info.token_expired ? 'token 已过期' : 'token 有效' }}
+            </el-tag>
+          </div>
+        </el-card>
+      </div>
 
       <!-- 积分包明细（两个上游通用） -->
       <el-card shadow="never" style="margin-top: 16px">
@@ -78,7 +94,12 @@
             <template #default="{ row }">{{ fmtNum(row.used) }}</template>
           </el-table-column>
           <el-table-column label="过期时间" width="140">
-            <template #default="{ row }">{{ row.end_time || '—' }}</template>
+            <template #default="{ row }">
+              <el-tag v-if="isExpiringSoon(row)" size="small" type="danger" effect="dark">
+                {{ row.end_time }}
+              </el-tag>
+              <span v-else>{{ row.end_time || '—' }}</span>
+            </template>
           </el-table-column>
         </el-table>
       </el-card>
@@ -95,7 +116,46 @@ const info = ref<CreditsInfo | null>(null)
 const error = ref('')
 const loading = ref(false)
 
-const packs = computed(() => info.value?.packs ?? [])
+const packs = computed(() => {
+  const list = info.value?.packs ?? []
+  // 按过期时间升序（即将过期的排前面），无日期的排末尾
+  return [...list].sort((a, b) => {
+    const da = parseDate(a.end_time)
+    const db = parseDate(b.end_time)
+    if (!da && !db) return 0
+    if (!da) return 1
+    if (!db) return -1
+    return da.getTime() - db.getTime()
+  })
+})
+
+// 7 天内即将过期的积分项（end_time 为 "YYYY-MM-DD" 本地日期）
+const EXPIRING_DAYS = 7
+
+function parseDate(s?: string | null): Date | null {
+  if (!s) return null
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s)
+  if (!m) return null
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+}
+
+function isExpiringSoon(row: { end_time?: string | null }): boolean {
+  const d = parseDate(row.end_time)
+  if (!d) return false
+  const now = new Date()
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const deadline = new Date(today)
+  deadline.setDate(deadline.getDate() + EXPIRING_DAYS)
+  return d >= today && d <= deadline
+}
+
+const expiringSoon = computed(() => {
+  const items = packs.value.filter(isExpiringSoon)
+  return {
+    count: items.length,
+    sum: items.reduce((acc, p) => acc + (Number(p.remaining) || 0), 0),
+  }
+})
 
 function fmtNum(n: unknown): string {
   const v = typeof n === 'number' ? n : parseFloat(String(n ?? ''))
@@ -121,9 +181,12 @@ watch(upstream, load)
 </script>
 
 <style scoped>
-.stat-label { color: var(--el-text-color-secondary); font-size: 13px; }
-.stat-value { font-size: 28px; font-weight: 700; margin-top: 6px; }
+.stat-row { display: flex; gap: 12px; }
+.stat-card { flex: 1; min-width: 0; }
+.stat-label { color: var(--el-text-color-secondary); font-size: 12px; }
+.stat-value { font-size: 22px; font-weight: 700; margin-top: 4px; }
 .stat-value.primary { color: var(--el-color-primary); }
-.stat-value-small { font-size: 16px; font-weight: 600; margin-top: 10px; word-break: break-all; }
+.stat-value.danger { color: var(--el-color-danger); }
+.stat-value-small { font-size: 14px; font-weight: 600; margin-top: 6px; word-break: break-all; }
 .stat-sub { color: var(--el-text-color-secondary); font-size: 12px; margin-top: 4px; }
 </style>

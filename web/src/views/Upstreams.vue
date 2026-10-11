@@ -35,9 +35,10 @@
         <el-table-column label="模型数" width="90">
           <template #default="{ row }">{{ row.model_count ?? '-' }}</template>
         </el-table-column>
-        <el-table-column label="后端地址覆盖（buddy）">
+        <el-table-column label="后端地址覆盖">
           <template #default="{ row }">
             <el-input v-if="row.name === 'buddy'" v-model="row.backend" placeholder="留空用默认 https://copilot.tencent.com" />
+            <el-input v-else-if="row.name === 'opencode-free'" v-model="row.backend" placeholder="留空用默认 https://opencode.ai/zen/v1" />
             <span v-else class="dim">—</span>
           </template>
         </el-table-column>
@@ -75,7 +76,7 @@ interface Row {
   healthSummary: string
 }
 
-const knownNames = ['buddy', 'trae', 'opencode']
+const knownNames = ['buddy', 'trae', 'opencode', 'opencode-free']
 
 const rows = computed<Row[]>(() => {
   const names = new Set<string>([...Object.keys(cfg.value.upstreams), ...knownNames])
@@ -119,7 +120,7 @@ async function save() {
     for (const r of rows.value) {
       upstreams[r.name] = {
         enabled: r.enabled,
-        backend: r.name === 'codebuddy' ? r.backend : undefined,
+        backend: r.name === 'buddy' || r.name === 'opencode-free' ? r.backend : undefined,
         chat_host: r.name === 'trae' ? r.chat_host : undefined,
       }
     }

@@ -8,6 +8,7 @@ import App from './App.vue'
 import Dashboard from './views/Dashboard.vue'
 import Upstreams from './views/Upstreams.vue'
 import Models from './views/Models.vue'
+import Speed from './views/Speed.vue'
 import Checkin from './views/Checkin.vue'
 import Credits from './views/Credits.vue'
 import Logs from './views/Logs.vue'
@@ -19,6 +20,7 @@ const router = createRouter({
     { path: '/dashboard', component: Dashboard, meta: { title: '汇总统计' } },
     { path: '/upstreams', component: Upstreams, meta: { title: '上游配置' } },
     { path: '/models', component: Models, meta: { title: '模型同步' } },
+    { path: '/speed', component: Speed, meta: { title: '吞吐速度' } },
     { path: '/checkin', component: Checkin, meta: { title: '一键签到' } },
     { path: '/credits', component: Credits, meta: { title: '积分看板' } },
     { path: '/logs', component: Logs, meta: { title: '日志' } },

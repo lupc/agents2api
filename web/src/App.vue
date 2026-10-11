@@ -12,6 +12,9 @@
         <el-menu-item index="/models">
           <el-icon><Cpu /></el-icon><span>模型同步</span>
         </el-menu-item>
+        <el-menu-item index="/speed">
+          <el-icon><Odometer /></el-icon><span>吞吐速度</span>
+        </el-menu-item>
         <el-menu-item index="/checkin">
           <el-icon><Calendar /></el-icon><span>一键签到</span>
         </el-menu-item>

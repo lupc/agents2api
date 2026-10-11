@@ -83,6 +83,8 @@ export interface CreditsInfo {
   consumed_credits?: number
   remaining_credits?: number
   consumption_ratio?: number
+  today_consumed?: number
+  today_consumed_error?: string
   packs?: { name: string | null; code?: string | null; remaining?: number; total?: number; used?: number; end_time?: string | null; expire_time?: number | null }[]
   ent_usage_error?: string
   checkin_status_error?: string
@@ -102,20 +104,109 @@ export interface ModelInfo {
 export interface AdminSettings {
   daily_sync_enabled: boolean
   daily_sync_time: string
+  checkin_auto_enabled: boolean
+  checkin_times: string[]
+}
+
+export interface SpeedSummary {
+  turns: number
+  avg_prefill_tps: number
+  avg_prefill_fresh_tps: number
+  avg_decode_tps: number
+  prompt_tokens: number
+  cached_tokens: number
+  completion_tokens: number
+}
+
+export interface SpeedBucket {
+  /** 小时粒度时为 `YYYY-MM-DD HH`，天粒度时为 `YYYY-MM-DD` */
+  hour?: string
+  date?: string
+  turns: number
+  avg_prefill_tps: number
+  avg_prefill_fresh_tps: number
+  avg_decode_tps: number
+  prompt_tokens: number
+  cached_tokens: number
+  completion_tokens: number
+}
+
+export interface SpeedModelRow {
+  upstream: string
+  model: string
+  turns: number
+  avg_prefill_tps: number
+  avg_prefill_fresh_tps: number
+  avg_decode_tps: number
+  prompt_tokens: number
+  cached_tokens: number
+  completion_tokens: number
+}
+
+export interface SpeedModelSeries {
+  upstream: string
+  model: string
+  hourly: {
+    hour: string
+    turns: number
+    avg_prefill_tps: number
+    avg_prefill_fresh_tps: number
+    avg_decode_tps: number
+    prompt_tokens: number
+    cached_tokens: number
+    completion_tokens: number
+  }[]
+}
+
+export interface SpeedTurn {
+  time: string
+  hour: string
+  upstream: string
+  model: string
+  stream: boolean
+  prompt_tokens: number
+  cached_tokens: number
+  completion_tokens: number
+  ttft_ms: number
+  duration_ms: number
+  /** 生成阶段耗时（duration - ttft）；过小则解码速度不可信 */
+  gen_ms: number
+  prefill_tps: number
+  prefill_fresh_tps: number
+  decode_tps: number
+}
+
+export interface SpeedData {
+  window_hours: number
+  summary: SpeedSummary
+  hourly: SpeedBucket[]
+  daily: SpeedBucket[]
+  models: SpeedModelRow[]
+  models_series: SpeedModelSeries[]
+  turns: SpeedTurn[]
+}
+
+export interface CheckinAllResult {
+  ok: boolean
+  ok_count: number
+  total: number
+  results: { ok: boolean; result: CheckinRecord }[]
 }
 
 export const api = {
   overview: (days = 7) => client.get<Overview>('/overview', { params: { days } }).then(r => r.data),
   usage: (days = 7) => client.get<{ window_days: number; days: UsageDay[] }>('/stats/usage', { params: { days } }).then(r => r.data),
   modelLatency: (days = 7) => client.get<{ models: ModelLatency[] }>('/stats/models', { params: { days } }).then(r => r.data),
+speed: (hours = 24, recent = 100) => client.get<SpeedData>('/stats/speed', { params: { hours, recent } }).then(r => r.data),
   upstreams: () => client.get<{ upstreams: UpstreamRow[] }>('/upstreams').then(r => r.data),
   getConfig: () => client.get<AdminConfig>('/config').then(r => r.data),
   putConfig: (cfg: unknown) => client.put('/config', cfg).then(r => r.data),
   getSettings: () => client.get<AdminSettings>('/settings').then(r => r.data),
-  putSettings: (s: AdminSettings) => client.put('/settings', s).then(r => r.data),
+  putSettings: (s: Partial<AdminSettings>) => client.put('/settings', s).then(r => r.data),
   models: () => client.get<{ by_upstream: { upstream: string; models: string[] }[]; snapshot?: { synced_at: string; by_upstream: Record<string, { count?: number; models?: ModelInfo[]; error?: string | null }> } }>('/models').then(r => r.data),
   sync: () => client.post<{ ok: boolean; synced_at: string; by_upstream: Record<string, { count?: number; models?: ModelInfo[]; error?: string | null }> }>('/sync').then(r => r.data),
   checkin: (upstream: 'trae' | 'buddy') => client.post<{ ok: boolean; result: CheckinRecord }>(`/checkin/${upstream}`).then(r => r.data),
+  checkinAll: () => client.post<CheckinAllResult>('/checkin/all').then(r => r.data),
   checkinResults: (days = 30, upstream: 'trae' | 'buddy' = 'trae') => client.get<{ records: CheckinRecord[]; trend: { date: string; ok: number; already: number; failed: number }[] }>('/checkin/results', { params: { days, upstream } }).then(r => r.data),
   credits: (upstream: 'trae' | 'buddy') => client.get<CreditsInfo>(`/credits/${upstream}`).then(r => r.data),
   logs: (lines = 200) => client.get<{ lines: string[]; file: string | null }>('/logs', { params: { lines } }).then(r => r.data),
