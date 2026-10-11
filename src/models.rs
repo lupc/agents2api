@@ -74,18 +74,20 @@ fn load_models_from_workbuddy() -> Vec<String> {
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) => {
-            crate::config::log(&format!(
-                "Warning: Failed to load models from WorkBuddy product.json: {e}"
-            ));
+            crate::config::log_at(
+                crate::config::Level::Warn,
+                &format!("Failed to load models from WorkBuddy product.json: {e}"),
+            );
             return Vec::new();
         }
     };
     let data: Value = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(e) => {
-            crate::config::log(&format!(
-                "Warning: Failed to load models from WorkBuddy product.json: {e}"
-            ));
+            crate::config::log_at(
+                crate::config::Level::Warn,
+                &format!("Failed to parse WorkBuddy product.json: {e}"),
+            );
             return Vec::new();
         }
     };

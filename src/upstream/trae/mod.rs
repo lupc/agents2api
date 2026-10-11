@@ -161,7 +161,10 @@ impl Upstream for TraeUpstream {
             if !tail.is_empty() {
                 yield Ok(bytes::Bytes::from(tail));
             }
-            crate::config::log(&format!("── TRAE RAW SSE ──\n{raw_log}"));
+            crate::config::log_at(
+                crate::config::Level::Trace,
+                &format!("── TRAE RAW SSE ──\n{raw_log}"),
+            );
         })
     }
 

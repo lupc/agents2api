@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use crate::anthropic::{anthropic_request_to_chat, AnthropicStreamConverter};
 use crate::auth::parse_headers;
-use crate::config::{err_chain, log_rid, new_rid, AppState, SharedState};
+use crate::config::{err_chain, log_rid, log_rid_at, new_rid, AppState, Level, SharedState};
 use crate::desensitize::desensitize_body;
 use crate::identity::filter_system_identity;
 use crate::projection::project_responses_chat_body;
@@ -66,6 +66,8 @@ pub fn router(state: SharedState) -> Router {
     let admin_state = crate::admin::AdminState {
         app: state.clone(),
         data_dir: state.data_dir.clone(),
+        db: state.db.clone(),
+        recorder: state.recorder.clone(),
     };
     let mut app = Router::new()
         // 无前缀 → 默认上游
@@ -310,13 +312,88 @@ fn metrics_model(chat_body: &Value) -> String {
         .to_string()
 }
 
+/// 流结束时统一落一次统计的收尾守卫。
+///
+/// 放在独立结构体里并于 `Drop` 中落盘，是为了让**客户端中断**（取消 SSE 流、
+/// 关闭连接、按 Esc）也能记录该轮：`async_stream` 生成器被 drop 时，循环后面的
+/// 收尾代码不会执行，但本守卫的 `Drop` 一定会跑。若只用循环末尾收尾，
+/// 被取消的轮次会完全丢失（对话里表现为「明明发了 2 轮，只记 1 轮」）。
+struct StreamFinalizer {
+    metrics: Arc<crate::admin::MetricsStore>,
+    speed: Arc<crate::admin::speed::SpeedStore>,
+    recorder: crate::admin::db::Recorder,
+    upstream: String,
+    model: String,
+    is_stream: bool,
+    ttfb_ms: u64,
+    started: Instant,
+    ttft: Option<u64>,
+    stats: StreamStats,
+    /// 是否已在正常路径落过盘（避免与 Drop 重复记录）。
+    done: bool,
+}
+
+impl StreamFinalizer {
+    /// 落盘一次统计（幂等）。
+    fn finish(&mut self, ok: bool) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        let elapsed_ms = self.started.elapsed().as_millis() as u64;
+        let duration_ms = self.ttfb_ms + elapsed_ms;
+        self.metrics.record(
+            crate::admin::metrics::Record {
+                upstream: self.upstream.clone(),
+                model: self.model.clone(),
+                stream: self.is_stream,
+                ok,
+                prompt_tokens: self.stats.prompt_tokens,
+                completion_tokens: self.stats.completion_tokens,
+                duration_ms,
+                ttfb_ms: self.ttfb_ms,
+            },
+            &self.recorder,
+        );
+        // 速度统计：TTFT 含上游往返 + prefill，故需加上 ttfb_ms。
+        // 失败/被取消的轮次也记录——实测到的部分 token 同样是有效观测。
+        let ttft_total = self.ttft.map(|t| self.ttfb_ms + t).unwrap_or(duration_ms);
+        self.speed.record(
+            crate::admin::speed::Turn {
+                upstream: self.upstream.clone(),
+                model: self.model.clone(),
+                stream: self.is_stream,
+                prompt_tokens: self.stats.prompt_tokens,
+                completion_tokens: self.stats.completion_tokens,
+                cached_tokens: self.stats.cached_tokens,
+                ttft_ms: ttft_total,
+                duration_ms,
+            },
+            &self.recorder,
+        );
+    }
+}
+
+impl Drop for StreamFinalizer {
+    fn drop(&mut self) {
+        // 流被提前丢弃（客户端中断）：按「已产出的部分」记账，ok=false
+        self.finish(false);
+    }
+}
+
 /// 给上游字节流套一层统计：转发不变，流结束时记一次请求统计。
 ///
 /// 单一记录点覆盖全部端点与流式/非流式两种模式——因为 `execute_aggregate`
 /// 也是消费这条流来聚合的。
+///
+/// 同时测量 TTFT（请求发出 → 首个内容 token），用于速度统计：
+/// 预填充速度 = prompt_tokens / TTFT，解码速度 = completion_tokens / (总耗时 - TTFT)。
+/// 非流式模式整轮聚合成一个响应，TTFT 等于总耗时，故解码速度为 0（不可分阶段）。
 fn instrument_stream(
     stream: ByteStream,
     metrics: Arc<crate::admin::MetricsStore>,
+    speed: Arc<crate::admin::speed::SpeedStore>,
+    recorder: crate::admin::db::Recorder,
     upstream: String,
     model: String,
     is_stream: bool,
@@ -324,13 +401,27 @@ fn instrument_stream(
 ) -> ByteStream {
     Box::pin(async_stream::stream! {
         let mut stream = stream;
-        let started = Instant::now();
+        let mut f = StreamFinalizer {
+            metrics,
+            speed,
+            recorder,
+            upstream,
+            model,
+            is_stream,
+            ttfb_ms,
+            started: Instant::now(),
+            ttft: None,
+            stats: StreamStats::new(),
+            done: false,
+        };
         let mut ok = true;
-        let mut stats = StreamStats::new();
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(b) => {
-                    stats.feed(&b);
+                    f.stats.feed(&b);
+                    if f.stats.saw_token && f.ttft.is_none() {
+                        f.ttft = Some(f.started.elapsed().as_millis() as u64);
+                    }
                     yield Ok(b);
                 }
                 Err(e) => {
@@ -340,17 +431,7 @@ fn instrument_stream(
                 }
             }
         }
-        metrics.record(crate::admin::metrics::Record {
-            upstream,
-            model,
-            stream: is_stream,
-            ok,
-            prompt_tokens: stats.prompt_tokens,
-            completion_tokens: stats.completion_tokens,
-            duration_ms: ttfb_ms + started.elapsed().as_millis() as u64,
-            ttfb_ms,
-        });
-        metrics.flush_if_due();
+        f.finish(ok);
     })
 }
 
@@ -362,17 +443,19 @@ fn record_failure(
     is_stream: bool,
     ttfb_ms: u64,
 ) {
-    state.metrics.record(crate::admin::metrics::Record {
-        upstream: upstream.to_string(),
-        model: model.to_string(),
-        stream: is_stream,
-        ok: false,
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        duration_ms: ttfb_ms,
-        ttfb_ms,
-    });
-    state.metrics.flush_if_due();
+    state.metrics.record(
+        crate::admin::metrics::Record {
+            upstream: upstream.to_string(),
+            model: model.to_string(),
+            stream: is_stream,
+            ok: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            duration_ms: ttfb_ms,
+            ttfb_ms,
+        },
+        &state.recorder,
+    );
 }
 
 /// 统一执行：准备请求 → 发起 → 返回已转换的 OpenAI SSE 流。
@@ -391,7 +474,7 @@ async fn execute_upstream(
     let t0 = Instant::now();
 
     let prepared = upstream.prepare_chat(chat_body).await.map_err(|e| {
-        log_rid(rid, &format!("✗ 上游准备失败 | {label} | {e}"));
+        log_rid_at(Level::Error, rid, &format!("✗ 上游准备失败 | {label} | {e}"));
         record_failure(state, &up_name, &model, is_stream, t0.elapsed().as_millis() as u64);
         err_openai(StatusCode::BAD_GATEWAY, e, "auth_error")
     })?;
@@ -405,7 +488,7 @@ async fn execute_upstream(
         .await
         .map_err(|e| {
             let msg = format!("upstream error: {}", err_chain(&e));
-            log_rid(rid, &format!("✗ 网络错误 | {label} | {msg}"));
+            log_rid_at(Level::Error, rid, &format!("✗ 网络错误 | {label} | {msg}"));
             record_failure(state, &up_name, &model, is_stream, t0.elapsed().as_millis() as u64);
             err_openai(StatusCode::BAD_GATEWAY, msg, "upstream_error")
         })?;
@@ -414,14 +497,16 @@ async fn execute_upstream(
     let status = resp.status().as_u16();
     if status != 200 {
         let raw = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
-        log_rid(
+        log_rid_at(
+            Level::Error,
             rid,
             &format!(
                 "✗ HTTP {status} | {label} | {}",
                 truncate(&String::from_utf8_lossy(&raw), 200)
             ),
         );
-        log_rid(
+        log_rid_at(
+            Level::Trace,
             rid,
             &format!("── ERROR BODY ──\n{}", String::from_utf8_lossy(&raw)),
         );
@@ -436,7 +521,8 @@ async fn execute_upstream(
         rid,
         &format!("… 上游已响应 | {label} | {:.2}s", t0.elapsed().as_secs_f64()),
     );
-    log_rid(
+    log_rid_at(
+        Level::Trace,
         rid,
         &format!(
             "── 发往上游的 WIRE BODY ──\n{}",
@@ -447,6 +533,8 @@ async fn execute_upstream(
     Ok(Executed::Stream(instrument_stream(
         translated,
         state.metrics.clone(),
+        state.speed.clone(),
+        state.recorder.clone(),
         up_name,
         model,
         is_stream,
@@ -470,7 +558,7 @@ fn into_sse(executed: Executed, rid: String, label: String) -> Response {
                 }
                 Err(e) => {
                     let msg = err_chain(&e);
-                    log_rid(&rid, &format!("✗ 流中断 | {label} | {msg}"));
+                    log_rid_at(Level::Error, &rid, &format!("✗ 流中断 | {label} | {msg}"));
                     yield Ok(Bytes::from(err_event(&msg, 502)));
                     break;
                 }
@@ -525,7 +613,7 @@ async fn execute_aggregate(
             }
             Err(e) => {
                 let msg = format!("upstream error: {}", err_chain(&e));
-                log_rid(rid, &format!("✗ 流中断 | {label} | {msg}"));
+                log_rid_at(Level::Error, rid, &format!("✗ 流中断 | {label} | {msg}"));
                 return Err(err_openai(StatusCode::BAD_GATEWAY, msg, "upstream_error"));
             }
         }
@@ -550,7 +638,7 @@ async fn execute_aggregate_with_retry(
             Ok(b) => raw.extend_from_slice(&b),
             Err(e) => {
                 let msg = format!("upstream error: {}", err_chain(&e));
-                log_rid(rid, &format!("✗ 流中断 | {label} | {msg}"));
+                log_rid_at(Level::Error, rid, &format!("✗ 流中断 | {label} | {msg}"));
                 return Err(err_openai(StatusCode::BAD_GATEWAY, msg, "upstream_error"));
             }
         }
@@ -735,7 +823,8 @@ async fn chat_completions_impl(
         req_log.push_str(&format!(" | last_user={:?}", truncate(&last_user, 60)));
     }
     log_rid(&rid, &req_log);
-    log_rid(
+    log_rid_at(
+        Level::Trace,
         &rid,
         &format!(
             "── REQUEST BODY (客户端原始) ──\n{}",
@@ -793,7 +882,8 @@ fn log_finish(label: &str, result: &Value, rid: &str) {
     }
     line.push_str(&format!(" | tokens={total_tokens}"));
     log_rid(rid, &line);
-    log_rid(
+    log_rid_at(
+        Level::Trace,
         rid,
         &format!(
             "── RESPONSE BODY ──\n{}",
@@ -898,7 +988,8 @@ async fn create_response_impl(
         &format!("▶ RESPONSES {label} | stream={client_wants_stream} | input_items={input_len}"),
     );
     log_rid(&rid, &format!("── RESPONSES PROJECTION ── {projection_stats}"));
-    log_rid(
+    log_rid_at(
+        Level::Trace,
         &rid,
         &format!(
             "── RESPONSES → CHAT BODY ──\n{}",
@@ -956,7 +1047,8 @@ async fn create_response_impl(
                     };
                 }
                 log_rid(&rid, &format!("◀ RESPONSES {label} | done"));
-                log_rid(
+                log_rid_at(
+                    Level::Trace,
                     &rid,
                     &format!(
                         "── RESPONSE OBJ ──\n{}",
@@ -1116,7 +1208,8 @@ async fn create_message_impl(
             "▶ ANTHROPIC {label} | msgs={chat_messages} | anthropic_msgs={anthropic_msgs} | user_stream={user_stream}"
         ),
     );
-    log_rid(
+    log_rid_at(
+        Level::Trace,
         &rid,
         &format!(
             "── ANTHROPIC → CHAT BODY ──\n{}",
@@ -1396,6 +1489,7 @@ mod tests {
     fn test_state() -> SharedState {
         let mut upstreams: HashMap<String, Arc<dyn Upstream>> = HashMap::new();
         upstreams.insert("trae".to_string(), Arc::new(MockTraeUpstream));
+        let (db, recorder) = test_db();
         Arc::new(AppState {
             config: crate::config::AppConfig {
                 api_key: String::new(),
@@ -1406,13 +1500,38 @@ mod tests {
             registry_base: Default::default(),
             cli_default_upstream: "trae".to_string(),
             http: reqwest::Client::new(),
-            metrics: std::sync::Arc::new(crate::admin::MetricsStore::load(
-                &std::env::temp_dir().join("agents2api-test-metrics"),
-            )),
+            metrics: std::sync::Arc::new(crate::admin::MetricsStore::new(db.clone())),
+            speed: std::sync::Arc::new(crate::admin::speed::SpeedStore::new(db.clone())),
+            db,
+            recorder,
             data_dir: std::env::temp_dir().join("agents2api-test"),
             log_dir: None,
             admin_enabled: false,
         })
+    }
+
+    /// 建一个临时文件 SQLite + 写入句柄（供同步测试构造 `AppState`）。
+    fn test_db() -> (crate::admin::db::Db, crate::admin::db::Recorder) {
+        test_db_tagged("state")
+    }
+
+    fn test_db_tagged(tag: &str) -> (crate::admin::db::Db, crate::admin::db::Recorder) {
+        let dir = std::env::temp_dir().join(format!("a2a-{tag}-{}", crate::rand_hex(6)));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 在独立线程上建 runtime 并 park 住（保活后台写入任务），
+        // 这样无论调用方在同步测试还是 #[tokio::test] 内都可用。
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let pair = rt.block_on(async {
+                let db = crate::admin::db::Db::init(&dir).await.unwrap();
+                let recorder = crate::admin::db::Recorder::spawn(db.connection());
+                (db, recorder)
+            });
+            let _ = tx.send(pair);
+            std::thread::park();
+        });
+        rx.recv().unwrap()
     }
 
     #[test]
@@ -1511,6 +1630,7 @@ mod tests {
     fn test_check_auth_enforced_when_key_set() {
         let mut upstreams: HashMap<String, Arc<dyn Upstream>> = HashMap::new();
         upstreams.insert("trae".to_string(), Arc::new(MockTraeUpstream));
+        let (db, recorder) = test_db_tagged("auth");
         let state = AppState {
             config: crate::config::AppConfig {
                 api_key: "secret".to_string(),
@@ -1521,9 +1641,10 @@ mod tests {
             registry_base: Default::default(),
             cli_default_upstream: "trae".to_string(),
             http: reqwest::Client::new(),
-            metrics: std::sync::Arc::new(crate::admin::MetricsStore::load(
-                &std::env::temp_dir().join("agents2api-test-metrics"),
-            )),
+            metrics: std::sync::Arc::new(crate::admin::MetricsStore::new(db.clone())),
+            speed: std::sync::Arc::new(crate::admin::speed::SpeedStore::new(db.clone())),
+            db,
+            recorder,
             data_dir: std::env::temp_dir().join("agents2api-test"),
             log_dir: None,
             admin_enabled: false,
@@ -1543,6 +1664,76 @@ mod tests {
             Ok(_) => panic!("应当返回错误"),
             Err(resp) => assert_eq!(resp.status(), StatusCode::NOT_FOUND),
         }
+    }
+
+    /// 客户端中断（丢弃 SSE 流）时，收尾守卫的 Drop 仍应记下这一轮。
+    #[tokio::test]
+    async fn test_stream_drop_still_records_turn() {
+        // 客户端中断（丢弃 SSE 流）时，收尾守卫的 Drop 仍应记下这一轮
+        // 用唯一临时目录，避免多次运行残留导致断言失败
+        let dir = std::env::temp_dir().join(format!("a2a-drop-{}", crate::rand_hex(6)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::admin::db::Db::init(&dir).await.unwrap();
+        let recorder = crate::admin::db::Recorder::spawn(db.connection());
+        let metrics = std::sync::Arc::new(crate::admin::MetricsStore::new(db.clone()));
+        let speed = std::sync::Arc::new(crate::admin::speed::SpeedStore::new(db.clone()));
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\
+                   \"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
+                   data: [DONE]\n\n";
+        let raw: ByteStream = Box::pin(futures::stream::once(async move {
+            Ok(Bytes::from(sse.to_string()))
+        }));
+        {
+            let mut st = instrument_stream(
+                raw,
+                metrics.clone(),
+                speed.clone(),
+                recorder.clone(),
+                "trae".to_string(),
+                "m1".to_string(),
+                true,
+                100,
+            );
+            // 只取第一个 chunk 就丢弃模拟客户端中断
+            let _ = st.next().await;
+        }
+        // Drop 已执行：该轮应被写入队列，等待落库完成
+        recorder.flush().await;
+        let q = speed.query(24, 10).await.unwrap();
+        assert_eq!(q["summary"]["turns"], 1, "中断的轮次也应计入");
+        // 幂等：不会因正常路径再记一次
+        assert_eq!(q["turns"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_finalizer_finish_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("a2a-idem-{}", crate::rand_hex(6)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::admin::db::Db::init(&dir).await.unwrap();
+        let recorder = crate::admin::db::Recorder::spawn(db.connection());
+        let metrics = std::sync::Arc::new(crate::admin::MetricsStore::new(db.clone()));
+        let speed = std::sync::Arc::new(crate::admin::speed::SpeedStore::new(db.clone()));
+        let mut f = StreamFinalizer {
+            metrics,
+            speed: speed.clone(),
+            recorder: recorder.clone(),
+            upstream: "trae".to_string(),
+            model: "m1".to_string(),
+            is_stream: true,
+            ttfb_ms: 10,
+            started: Instant::now(),
+            ttft: Some(5),
+            stats: StreamStats::new(),
+            done: false,
+        };
+        f.finish(true);
+        f.finish(true); // 第二次应被忽略
+        drop(f); // Drop 也不应重复记录
+        recorder.flush().await;
+        assert_eq!(speed.query(24, 10).await.unwrap()["summary"]["turns"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 非流式聚合结果 → Responses 对象的重放。

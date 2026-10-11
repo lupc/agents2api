@@ -3,6 +3,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::upstream::Upstream;
@@ -92,10 +93,104 @@ fn new_rotating_mode(dir: PathBuf, max_file_size: u64) -> LogMode {
     }
 }
 
+/// 日志等级：默认 `debug`，`trace` 输出请求/响应体等逐字明细。
+///
+/// 顺序 `Error < Warn < Info < Debug < Trace`，设置某等级即放出该等级及更严重者。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Level {
+    /// 错误：上游失败、网络错误、流中断。
+    Error,
+    /// 警告：降级容错、非致命异常。
+    Warn,
+    /// 关键运行事件：启动横幅、上游注册表重载、定时任务触发。
+    Info,
+    /// 调试：逐请求的起止、耗时、token 数。
+    Debug,
+    /// 逐字明细：请求体、响应体、上游 wire body、原始 SSE。仅排障时开启。
+    Trace,
+}
+
+impl Level {
+    /// 从字符串解析（不区分大小写），无法识别时返回 None。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "error" => Some(Level::Error),
+            "warn" | "warning" => Some(Level::Warn),
+            "info" => Some(Level::Info),
+            "debug" => Some(Level::Debug),
+            "trace" => Some(Level::Trace),
+            _ => None,
+        }
+    }
+
+    /// 规范小写名（供启动横幅回显）。
+    pub fn name(self) -> &'static str {
+        match self {
+            Level::Error => "error",
+            Level::Warn => "warn",
+            Level::Info => "info",
+            Level::Debug => "debug",
+            Level::Trace => "trace",
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Level::Error => "ERROR",
+            Level::Warn => "WARN",
+            Level::Info => "INFO",
+            Level::Debug => "DEBUG",
+            Level::Trace => "TRACE",
+        }
+    }
+}
+
+/// 当前生效的日志等级（默认 `debug`）。
+static LEVEL: AtomicU8 = AtomicU8::new(3);
+
+/// 设置日志等级，返回是否解析成功。
+pub fn set_level(s: &str) -> bool {
+    match Level::parse(s) {
+        Some(l) => {
+            LEVEL.store(l as u8, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+/// 当前日志等级。
+pub fn level() -> Level {
+    match LEVEL.load(Ordering::Relaxed) {
+        0 => Level::Error,
+        1 => Level::Warn,
+        2 => Level::Info,
+        4 => Level::Trace,
+        _ => Level::Debug,
+    }
+}
+
+/// 指定等级是否应当输出。
+pub fn enabled(l: Level) -> bool {
+    l <= level()
+}
+
 /// 每条日志同时写控制台（stderr）与日志文件（若已配置）。
 pub fn log(msg: &str) {
+    write_log(Level::Debug, msg);
+}
+
+/// 以指定等级输出（等级低于阈值时被丢弃）。
+pub fn log_at(l: Level, msg: &str) {
+    write_log(l, msg);
+}
+
+fn write_log(l: Level, msg: &str) {
+    if !enabled(l) {
+        return;
+    }
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    let line = format!("[{ts}] {msg}\n");
+    let line = format!("[{ts}] [{}] {msg}\n", l.tag());
     eprint!("{line}");
     if let Some(Some(logger)) = LOGGER.get().map(|o| o.as_ref()) {
         logger.write_line(&line);
@@ -116,12 +211,20 @@ pub fn err_chain(e: &(dyn std::error::Error + 'static)) -> String {
     parts.join(": ")
 }
 
-/// 带请求 id 前缀的日志便捷封装。
+/// 带请求 id 前缀的日志便捷封装（`debug` 等级）。
 pub fn log_rid(rid: &str, msg: &str) {
+    log_rid_at(Level::Debug, rid, msg)
+}
+
+/// 带请求 id 前缀、 指定等级的日志便捷封装。
+pub fn log_rid_at(l: Level, rid: &str, msg: &str) {
+    if !enabled(l) {
+        return;
+    }
     if rid.is_empty() {
-        log(msg);
+        log_at(l, msg);
     } else {
-        log(&format!("[{rid}] {msg}"));
+        log_at(l, &format!("[{rid}] {msg}"));
     }
 }
 
@@ -177,8 +280,14 @@ pub struct AppState {
     /// 请求启动时的 CLI 默认上游（文件配置可能覆盖，实际默认以 registry 为准）。
     pub cli_default_upstream: String,
     pub http: reqwest::Client,
-    /// 请求统计（内存聚合 + 周期落盘）。
+    /// 请求统计（查询器，数据落 SQLite）。
     pub metrics: Arc<crate::admin::MetricsStore>,
+    /// 逐轮吞吐统计（查询器，数据落 SQLite）。
+    pub speed: Arc<crate::admin::speed::SpeedStore>,
+    /// 事件记录数据库（查询用句柄）。
+    pub db: crate::admin::db::Db,
+    /// 事件记录写入句柄（非阻塞入队，后台串行落库）。
+    pub recorder: crate::admin::db::Recorder,
     /// 数据目录（统计 / 签到记录 / 后台配置）。
     pub data_dir: PathBuf,
     /// 是否启用管理后台（/admin/*）。
@@ -221,6 +330,56 @@ pub fn new_rid() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_level_parse_and_order() {
+        assert_eq!(Level::parse("error"), Some(Level::Error));
+        assert_eq!(Level::parse("WARN"), Some(Level::Warn));
+        assert_eq!(Level::parse(" warning "), Some(Level::Warn));
+        assert_eq!(Level::parse("info"), Some(Level::Info));
+        assert_eq!(Level::parse("INFO"), Some(Level::Info));
+        assert_eq!(Level::parse("debug"), Some(Level::Debug));
+        assert_eq!(Level::parse("TRACE"), Some(Level::Trace));
+        assert_eq!(Level::parse("bogus"), None);
+        // 顺序：Error < Warn < Info < Debug < Trace（数值越大越啰嗦）
+        assert!(Level::Error < Level::Warn);
+        assert!(Level::Warn < Level::Info);
+        assert!(Level::Info < Level::Debug);
+        assert!(Level::Debug < Level::Trace);
+    }
+
+    #[test]
+    fn test_set_level_filters_lower_levels() {
+        assert!(set_level("trace"));
+        assert_eq!(level(), Level::Trace);
+        assert!(enabled(Level::Trace), "trace 等级应放出 trace");
+
+        assert!(set_level("debug"));
+        assert!(enabled(Level::Error) && enabled(Level::Info) && enabled(Level::Debug));
+        assert!(!enabled(Level::Trace), "debug 应屏蔽 trace");
+
+        // info：保留关键事件，屏蔽逐请求调试
+        assert!(set_level("info"));
+        assert!(enabled(Level::Warn) && enabled(Level::Info));
+        assert!(!enabled(Level::Debug), "info 应屏蔽 debug");
+
+        assert!(set_level("error"));
+        assert!(enabled(Level::Error));
+        assert!(!enabled(Level::Warn), "error 应屏蔽 warn");
+        assert!(!enabled(Level::Info), "error 应屏蔽 info");
+
+        // 非法值不改变当前等级
+        assert!(!set_level("nope"));
+        assert_eq!(level(), Level::Error);
+        set_level("debug");
+    }
+
+    #[test]
+    fn test_level_name_roundtrip() {
+        for l in [Level::Error, Level::Warn, Level::Info, Level::Debug, Level::Trace] {
+            assert_eq!(Level::parse(l.name()), Some(l), "name 应可被 parse 还原");
+        }
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
